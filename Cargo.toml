@@ -1,0 +1,34 @@
+[package]
+name = "stellar-fnmatch"
+version = "0.1.0"
+edition = "2021"
+description = "Corpus-wide function identity matching across Stellaris Windows builds"
+license = "MIT"
+
+[lib]
+name = "fnmatch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stellar-fnmatch"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "intel"] }
+pdb = "0.8"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = "0.13"
+memmap2 = "0.9"
+md-5 = "0.10"
+regex = "1"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 16

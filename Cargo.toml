@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Corpus-wide function identity matching across Stellaris Windows builds"
 license = "MIT"
+repository = "https://github.com/MattMills/stellar-fnmatch"
 
 [lib]
 name = "fnmatch"

@@ -1,10 +1,16 @@
 //! stellar-fnmatch: corpus-wide function identity matching across Stellaris Windows builds.
 //!
 //! Pipeline: `corpus` (inventory) -> `extract` (per-build features, `model::Build`) ->
-//! `solve` (fingerprints, global uniqueness, name voting, relational iteration) -> outputs.
+//! `corpusdb` (compact in-memory corpus) -> `solve` (fingerprints, global uniqueness, name voting,
+//! relational iteration) -> `eval` / outputs.
 
 pub mod corpus;
+pub mod corpusdb;
+pub mod eh;
+pub mod eval;
+pub mod exceptions;
 pub mod extract;
 pub mod model;
 pub mod pdbnames;
 pub mod pe;
+pub mod solve;

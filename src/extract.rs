@@ -456,6 +456,7 @@ struct FeatureCtx<'a> {
     func_index: &'a HashMap<u32, u32>,
     vtable_index: &'a HashMap<u32, u32>,
     strings_at: &'a HashMap<u32, u32>,
+    istr_at: &'a HashMap<u32, Vec<u32>>,
 }
 
 impl<'a> FeatureCtx<'a> {
@@ -732,6 +733,9 @@ fn features(fc: &FeatureCtx, entry: u32, d: &Decoded, f: &mut Func) {
             _ => {
                 if i.is_ip_rel_memory_operand() {
                     let t = i.ip_rel_memory_address() as u32;
+                    if let Some(ids) = fc.istr_at.get(&t) {
+                        f.istrings.extend_from_slice(ids);
+                    }
                     match fc.classify(t, i) {
                         DataKind::Code => {
                             if let Some(&fi) = fc.func_index.get(&t) {
@@ -857,7 +861,7 @@ pub fn extract(exe: &[u8], pdb: Option<&std::path::Path>, meta: BuildMeta) -> Re
     }
     let mut st = StringTable { map: HashMap::new(), list: Vec::new() };
     let mut strings_at: HashMap<u32, u32> = HashMap::new();
-    for t in lea_targets {
+    for &t in &lea_targets {
         if vtable_index.contains_key(&t) {
             continue;
         }
@@ -865,8 +869,65 @@ pub fn extract(exe: &[u8], pdb: Option<&std::path::Path>, meta: BuildMeta) -> Re
             strings_at.insert(t, st.id(s));
         }
     }
+    // indirect strings: relocated pointers to strings inside the first 64 bytes of any data object
+    // the code references (registration descriptors, static tables of names)
+    let mut data_targets: Vec<u32> = Vec::new();
+    for d in &decoded {
+        for i in &d.insns {
+            if i.is_ip_rel_memory_operand() {
+                let t = i.ip_rel_memory_address() as u32;
+                if !pe.is_code(t) && !import_by_iat.contains_key(&t) && !strings_at.contains_key(&t) && !vtable_index.contains_key(&t) {
+                    data_targets.push(t);
+                }
+            }
+        }
+    }
+    data_targets.sort_unstable();
+    data_targets.dedup();
+    let mut istr_at: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &t in &data_targets {
+        let lo = relocs.partition_point(|&r| r < t);
+        let mut ids = Vec::new();
+        for &loc in relocs[lo..].iter().take_while(|&&r| r < t.saturating_add(64)) {
+            if let Some(p) = pe.u64(loc).and_then(|v| pe.va_to_rva(v)) {
+                if !pe.is_code(p) {
+                    if let Some(s) = read_string(&pe, p) {
+                        ids.push(st.id(s));
+                    }
+                }
+            }
+        }
+        if !ids.is_empty() {
+            istr_at.insert(t, ids);
+        }
+    }
+    // data tables: runs of relocated code pointers in data sections (vtables, CRT initializer
+    // tables, registration and dispatch tables); one NULL entry may sit inside a run
+    let mut tables: Vec<Vec<u32>> = Vec::new();
+    {
+        let mut cur: Vec<u32> = Vec::new();
+        let mut last: u32 = 0;
+        for &loc in &relocs {
+            if pe.is_code(loc) {
+                continue;
+            }
+            let Some(t) = pe.u64(loc).and_then(|v| pe.va_to_rva(v)).filter(|&t| pe.is_code(t)) else { continue };
+            let contiguous = !cur.is_empty() && (loc == last + 8 || (loc == last + 16 && pe.u64(last + 8) == Some(0)));
+            if !contiguous {
+                if cur.len() >= 2 {
+                    tables.push(std::mem::take(&mut cur));
+                }
+                cur.clear();
+            }
+            cur.push(func_index.get(&t).copied().unwrap_or(u32::MAX));
+            last = loc;
+        }
+        if cur.len() >= 2 {
+            tables.push(cur);
+        }
+    }
 
-    let fc = FeatureCtx { pe: &pe, import_by_iat: &import_by_iat, func_index: &func_index, vtable_index: &vtable_index, strings_at: &strings_at };
+    let fc = FeatureCtx { pe: &pe, import_by_iat: &import_by_iat, func_index: &func_index, vtable_index: &vtable_index, strings_at: &strings_at, istr_at: &istr_at };
     let mut out_funcs: Vec<Func> = entries
         .par_iter()
         .zip(decoded.par_iter())
@@ -895,8 +956,15 @@ pub fn extract(exe: &[u8], pdb: Option<&std::path::Path>, meta: BuildMeta) -> Re
         i
     };
     let mut pdb_unmatched = Vec::new();
-    if let Some(p) = pdb {
-        let pn = pdbnames::read(p)?;
+    let pn = match pdb.map(pdbnames::read) {
+        Some(Ok(pn)) => Some(pn),
+        Some(Err(e)) => {
+            stats.pdb_error = Some(format!("{:#}", e));
+            None
+        }
+        None => None,
+    };
+    if let Some(pn) = pn {
         stats.pdb_procs = pn.procs.len() as u32;
         stats.pdb_publics = pn.publics.len() as u32;
         let starts: Vec<u32> = out_funcs.iter().map(|f| f.rva).collect();
@@ -940,6 +1008,23 @@ pub fn extract(exe: &[u8], pdb: Option<&std::path::Path>, meta: BuildMeta) -> Re
             slots: v.slots.iter().map(|s| starts.binary_search(s).map(|i| i as u32).unwrap_or(u32::MAX)).collect(),
         })
         .collect();
+    // unwind info of the primary .pdata entry: stack frame layout survives most body edits
+    let mut unwind_of: HashMap<u32, u32> = HashMap::new();
+    for rf in pe.pdata() {
+        if rf.flags & 0x4 == 0 {
+            unwind_of.insert(rf.begin, rf.unwind);
+        }
+    }
+    for f in out_funcs.iter_mut() {
+        if let Some(&u) = unwind_of.get(&f.rva) {
+            if let Some(hdr) = pe.bytes(u & !1, 4) {
+                let n = 4 + hdr[2] as usize * 2;
+                if let Some(b) = pe.bytes(u & !1, n) {
+                    f.h_unwind = xxh3_64(b);
+                }
+            }
+        }
+    }
     stats.seconds = t0.elapsed().as_secs_f64();
     Ok(Build {
         format_version: model::FORMAT_VERSION,
@@ -952,6 +1037,7 @@ pub fn extract(exe: &[u8], pdb: Option<&std::path::Path>, meta: BuildMeta) -> Re
         imports: imports.into_iter().map(|i| model::ImportRec { dll: i.dll, name: i.name, iat_rva: i.iat_rva }).collect(),
         exports: exports_rec,
         vtables: vtables_rec,
+        tables,
         names,
         pdb_unmatched,
         stats,

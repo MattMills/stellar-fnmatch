@@ -54,6 +54,52 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Solve the whole corpus: label every function of every stripped build
+    Solve {
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        extract_dir: PathBuf,
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// PDB builds to treat as stripped and score (comma separated build ids)
+        #[arg(long)]
+        holdout: Option<String>,
+        /// only builds whose version is in [min, max] (e.g. 3.9 and 3.12.99)
+        #[arg(long)]
+        min_version: Option<String>,
+        #[arg(long)]
+        max_version: Option<String>,
+        #[arg(long)]
+        rounds: Option<usize>,
+        /// parameter overrides as JSON (see solve::Params)
+        #[arg(long)]
+        params: Option<String>,
+        /// threads used for loading extracts
+        #[arg(long, default_value_t = 8)]
+        load_threads: usize,
+        /// do not write per-build label CSVs
+        #[arg(long)]
+        no_labels: bool,
+    },
+    /// Resolve stellaris.exe frames of exception.txt files to labelled functions (end-to-end check)
+    Exceptions {
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        extract_dir: PathBuf,
+        /// labels/ directory of a solve
+        #[arg(long)]
+        labels_dir: PathBuf,
+        /// directory searched recursively for *.txt
+        #[arg(long)]
+        input: PathBuf,
+        /// output directory (per-frame CSV and summary); keep it private
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(long, default_value_t = 2.0)]
+        hi_score: f32,
+    },
     /// Print statistics of extracted builds
     Info {
         files: Vec<PathBuf>,
@@ -77,6 +123,18 @@ fn extract_meta(meta: &model::BuildMeta, out: &Path) -> Result<model::Build> {
     let mut meta = meta.clone();
     meta.exe_md5 = md5_hex(&exe);
     meta.exe_size = exe.len() as u64;
+    if meta.version == "?" || meta.commit.is_none() {
+        // the build string is embedded in the executable: "<name> v<ver> [tag] <32 hex> (<date>)"
+        let re = regex::bytes::Regex::new(r"[A-Za-z ]{0,20} v\d+\.\d+(?:\.\d+)*[ -][ -~]{0,40}?[0-9a-f]{32} \([A-Z][a-z]{2} +\d{1,2} \d{4} \d\d:\d\d:\d\d\)").unwrap();
+        if let Some(m) = re.find(&exe) {
+            let s = String::from_utf8_lossy(m.as_bytes()).trim().to_string();
+            let (v, c, d) = corpus::parse_build_string(&s);
+            meta.build_string = s;
+            meta.version = v;
+            meta.commit = c;
+            meta.build_date = d;
+        }
+    }
     let pdb = meta.pdb_path.clone().map(PathBuf::from);
     let b = extract::extract(&exe, pdb.as_deref(), meta)?;
     b.save(out)?;
@@ -92,6 +150,42 @@ fn summary(b: &model::Build) -> String {
         s.unresolved_indirect_jumps, s.interior_refs, s.bad_decodes, b.strings.len(), b.vtables.len(), s.pdb_procs, s.pdb_procs_at_func_start,
         s.pdb_procs_inside_func, s.pdb_procs_outside, named, s.seconds
     )
+}
+
+/// Per target build: `rva,end,size,score,second,round,evidence,label` (label = names joined by " | ").
+fn write_labels(s: &fnmatch::solve::Solver, dir: &Path) -> Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    let db = &*s.db;
+    for (bi, b) in db.builds.iter().enumerate() {
+        if !s.target[bi] {
+            continue;
+        }
+        let f = std::fs::File::create(dir.join(format!("{}.csv", b.meta.id)))?;
+        let mut w = std::io::BufWriter::new(f);
+        writeln!(w, "rva,end,size,score,second,round,evidence,label")?;
+        for k in 0..b.n {
+            let mut a = s.assign[db.gid(bi, k) as usize];
+            if a.reject != fnmatch::solve::reject::NONE {
+                a = Default::default();
+            }
+            let end = b.ranges.row(k).first().map_or(b.rva[k], |r| r.1);
+            let label = if a.set != 0 { db.labels.display(a.set).replace('"', "\"\"") } else { String::new() };
+            writeln!(
+                w,
+                "0x{:x},0x{:x},{},{:.3},{:.3},{},{},\"{}\"",
+                b.rva[k],
+                end,
+                b.size[k],
+                a.score,
+                a.second,
+                a.round,
+                fnmatch::solve::kt_names(a.types),
+                label
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -139,6 +233,109 @@ fn main() -> Result<()> {
             let b = extract_meta(&meta, &out)?;
             eprintln!("{}", summary(&b));
         }
+        Cmd::Solve { corpus, extract_dir, out_dir, holdout, min_version, max_version, rounds, params, load_threads, no_labels } => {
+            let mut c: corpus::Corpus = serde_json::from_str(&std::fs::read_to_string(&corpus)?)?;
+            let vk = |v: &str| corpus::version_key(v);
+            if let Some(mn) = &min_version {
+                c.builds.retain(|b| b.version == "?" || vk(&b.version) >= vk(mn));
+            }
+            if let Some(mx) = &max_version {
+                c.builds.retain(|b| b.version == "?" || vk(&b.version) <= vk(mx));
+            }
+            std::fs::create_dir_all(&out_dir)?;
+            let holdout: Vec<String> = holdout.map(|s| s.split(',').map(|x| x.to_string()).collect()).unwrap_or_default();
+            let t0 = std::time::Instant::now();
+            let mut db = fnmatch::corpusdb::CorpusDb::load(&c, &extract_dir, &[], load_threads)?;
+            eprintln!(
+                "loaded {} builds, {} functions, {} names, {} label sets in {:.1}s",
+                db.builds.len(),
+                db.total,
+                db.labels.names.len(),
+                db.labels.sets.len(),
+                t0.elapsed().as_secs_f64()
+            );
+            let mut p = match &params {
+                Some(js) => serde_json::from_str::<fnmatch::solve::Params>(js)?,
+                None => fnmatch::solve::Params::default(),
+            };
+            if let Some(r) = rounds {
+                p.rounds = r;
+            }
+            let mut s = fnmatch::solve::Solver::new(&mut db, p, &holdout);
+            s.run();
+            if !holdout.is_empty() {
+                let ev = fnmatch::eval::evaluate(&s, &holdout);
+                fnmatch::eval::print(&ev);
+                std::fs::write(out_dir.join("eval.json"), serde_json::to_string_pretty(&ev)?)?;
+            }
+            std::fs::write(out_dir.join("solve.log"), s.log.join("\n"))?;
+            if !no_labels {
+                write_labels(&s, &out_dir.join("labels"))?;
+            }
+        }
+        Cmd::Exceptions { corpus, extract_dir, labels_dir, input, out_dir, hi_score } => {
+            let c: corpus::Corpus = serde_json::from_str(&std::fs::read_to_string(&corpus)?)?;
+            let mut files = Vec::new();
+            let mut stack = vec![input];
+            while let Some(d) = stack.pop() {
+                for e in std::fs::read_dir(&d)? {
+                    let p = e?.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p.extension().map_or(false, |x| x == "txt") {
+                        files.push(p);
+                    }
+                }
+            }
+            files.sort();
+            let (frames, summary) = fnmatch::exceptions::run(&c, &extract_dir, &labels_dir, &files, hi_score)?;
+            std::fs::create_dir_all(&out_dir)?;
+            {
+                use std::io::Write;
+                let mut w = std::io::BufWriter::new(std::fs::File::create(out_dir.join("frames.csv"))?);
+                writeln!(w, "file,frame,build,rva,func_rva,status,score,evidence,label")?;
+                for f in &frames {
+                    writeln!(w, "{},{},{},{},{},{},{:.3},{},\"{}\"", f.file, f.frame, f.build, f.rva, f.func_rva, f.status, f.score, f.evidence, f.label.replace('"', "\"\""))?;
+                }
+            }
+            std::fs::write(out_dir.join("summary.json"), serde_json::to_string_pretty(&summary)?)?;
+            // unlabelled crash functions, aggregated (no file names)
+            {
+                use std::io::Write;
+                let mut agg: std::collections::BTreeMap<(String, String), (usize, std::collections::BTreeSet<usize>)> = Default::default();
+                for f in frames.iter().filter(|f| f.status == "unlabelled") {
+                    let e = agg.entry((f.build.clone(), f.func_rva.clone())).or_default();
+                    e.0 += 1;
+                    e.1.insert(f.file);
+                }
+                let mut w = std::io::BufWriter::new(std::fs::File::create(out_dir.join("unlabelled.csv"))?);
+                writeln!(w, "build,func_rva,frames,files")?;
+                for ((b, r), (n, fs)) in &agg {
+                    writeln!(w, "{},{},{},{}", b, r, n, fs.len())?;
+                }
+            }
+            let mut tot = fnmatch::exceptions::VersionSummary::default();
+            println!("{:>8} {:>5} {:>6} {:>7} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9}  platforms", "version", "files", "frames", "no_sym", "in_func", "labelled", "lab>=hi", "all_lab", "distinctF", "distinctL");
+            for (v, s) in &summary {
+                println!(
+                    "{:>8} {:>5} {:>6} {:>7} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9}  {:?}",
+                    v, s.files, s.frames, s.frames_no_symbol, s.frames_in_function, s.frames_labelled, s.frames_labelled_hi, s.files_all_labelled, s.distinct_functions, s.distinct_labelled, s.files_by_platform
+                );
+                tot.files += s.files;
+                tot.frames += s.frames;
+                tot.frames_no_symbol += s.frames_no_symbol;
+                tot.frames_in_function += s.frames_in_function;
+                tot.frames_labelled += s.frames_labelled;
+                tot.frames_labelled_hi += s.frames_labelled_hi;
+                tot.files_all_labelled += s.files_all_labelled;
+                tot.distinct_functions += s.distinct_functions;
+                tot.distinct_labelled += s.distinct_labelled;
+            }
+            println!(
+                "{:>8} {:>5} {:>6} {:>7} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9}",
+                "total", tot.files, tot.frames, tot.frames_no_symbol, tot.frames_in_function, tot.frames_labelled, tot.frames_labelled_hi, tot.files_all_labelled, tot.distinct_functions, tot.distinct_labelled
+            );
+        }
         Cmd::Info { files, func, unmatched } => {
             for f in files {
                 let b = model::Build::load(&f)?;
@@ -159,8 +356,20 @@ fn main() -> Result<()> {
                     }
                 }
                 if let Some(rva) = &func {
-                    let rva = u32::from_str_radix(rva.trim_start_matches("0x"), 16)?;
+                    // "#N" selects function index N
+                    let rva = match rva.strip_prefix('#') {
+                        Some(ix) => b.funcs[ix.parse::<usize>()?].rva,
+                        None => u32::from_str_radix(rva.trim_start_matches("0x"), 16)?,
+                    };
+                    let mut lens: Vec<usize> = b.tables.iter().map(|t| t.len()).collect();
+                    lens.sort_unstable_by(|a, c| c.cmp(a));
+                    println!("tables {} total entries {} largest {:?}", b.tables.len(), lens.iter().sum::<usize>(), &lens[..lens.len().min(10)]);
                     if let Some(i) = b.func_containing(rva) {
+                        for (ti, t) in b.tables.iter().enumerate() {
+                            if let Some(p) = t.iter().position(|&e| e == i as u32) {
+                                println!("in table {} (len {}) at {}", ti, t.len(), p);
+                            }
+                        }
                         let fx = &b.funcs[i];
                         println!("{:#?}", fx);
                         for n in &fx.names {

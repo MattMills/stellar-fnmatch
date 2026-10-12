@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BuildMeta {
@@ -114,6 +114,9 @@ pub struct Func {
     pub globals: Vec<u32>,
     /// vtables whose address the code takes (constructors, destructors), indices into Build.vtables
     pub vtrefs: Vec<u32>,
+    /// strings reached through relocated pointers inside referenced data objects (indices into
+    /// Build.strings), address order
+    pub istrings: Vec<u32>,
     /// distinct notable immediates (|v| >= 0x100, not addresses), sorted
     pub imms: Vec<u64>,
     /// PDB procedure names starting here (indices into Build.names)
@@ -122,6 +125,9 @@ pub struct Func {
     pub publics: Vec<u32>,
     /// PDB procedure length, when a procedure starts here
     pub pdb_len: u32,
+    /// hash of the primary `.pdata` UNWIND_INFO (flags, prolog size, frame register, unwind codes),
+    /// 0 for leaf functions
+    pub h_unwind: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +177,8 @@ pub struct ExtractStats {
     pub pdb_procs_at_func_start: u32,
     pub pdb_procs_inside_func: u32,
     pub pdb_procs_outside: u32,
+    /// the PDB could not be read (the build is then treated as stripped)
+    pub pdb_error: Option<String>,
     pub seconds: f64,
 }
 
@@ -187,6 +195,8 @@ pub struct Build {
     pub imports: Vec<ImportRec>,
     pub exports: Vec<ExportRec>,
     pub vtables: Vec<VtableRec>,
+    /// runs of relocated code pointers in data sections (function index or u32::MAX per entry)
+    pub tables: Vec<Vec<u32>>,
     /// PDB names (procedure names undecorated, publics mangled)
     pub names: Vec<String>,
     /// PDB procedures that do not start at an extracted function (diagnostics)
@@ -196,7 +206,7 @@ pub struct Build {
 
 impl Build {
     pub fn has_pdb(&self) -> bool {
-        self.meta.pdb_path.is_some()
+        self.meta.pdb_path.is_some() && self.stats.pdb_error.is_none() && self.stats.pdb_procs > 0
     }
 
     pub fn func_at(&self, rva: u32) -> Option<usize> {

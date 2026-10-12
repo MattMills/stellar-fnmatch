@@ -20,7 +20,7 @@ date from the version string). `BuildMeta`:
 | `exe_path`, `pdb_path` | inputs; `pdb_path` is null for stripped builds |
 | `exe_md5`, `exe_size` | filled in by `extract` |
 
-## `<build id>.fnx`: extract (`extract`, format 4)
+## `<build id>.fnx`: extract (`extract`, format 5)
 
 `Build`:
 
@@ -59,6 +59,7 @@ date from the version string). `BuildMeta`:
 | `imms` | notable immediates |
 | `names`, `publics`, `pdb_len` | PDB data when the build has a PDB |
 | `eh_parent`, `eh_kind` | for C++ EH funclets: the owning function (from its FH3/FH4 FuncInfo) and 1 = unwind, 2 = catch |
+| `call_rets` | RVAs right after each call instruction (the return addresses a stack trace shows) |
 
 ## `<build id>.sig`: per-executable signatures (`sigs`, format 1)
 
@@ -104,3 +105,17 @@ with ` | `; EH funclets carry their owner's label with ` [unwind funclet]` / ` [
 `build_id,version,platform,exe_md5,start_va,end_va,score,evidence,symbol` for every labelled
 function of every target, with virtual addresses (image base 0x140000000 + RVA) like the
 stellar-fnaddr tables, ready for loading into a new table.
+
+## `webdata/`: static data for the exception translator web app (`webdata`)
+
+Used by stellar-except-web 2.0 instead of a database; metadata only, no code bytes. All integers
+little-endian; `src/webdata.rs` has the authoritative description.
+
+| file | content |
+|---|---|
+| `builds.json` | builds (id, platform, version, build string, commit, date, exe md5, image base, whether names come from the build's own PDB, counts) and `versions`: version -> build ids, Steam first |
+| `names.idx`, `names.dat` | string table: `SFN1`, u32 count, count+1 u32 offsets into `names.dat` |
+| `builds/<id>.funcs` | `SFF1`, u32 count, u64 image base, then 24-byte records sorted by start: start rva, end rva, function entry rva, name id, evidence id (u32 each, 0xFFFFFFFF = none), u16 score x100, u8 source (1 PDB, 2 matched, 3 EH funclet named after its owner, 4 unnamed: the name describes its named neighbours), u8 funclet kind; one record per code chunk |
+| `builds/<id>.rets` | `SFR1`, u32 count, sorted u32 return-address RVAs (tells which build a report came from) |
+| `builds/<id>.exports.json` | export name (mangled and plain) -> rva |
+| `meta.json` | generation details |

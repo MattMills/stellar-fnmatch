@@ -695,6 +695,10 @@ fn features(fc: &FeatureCtx, entry: u32, d: &Decoded, f: &mut Func) {
             block_len = 0;
         }
 
+        // return addresses of call sites (crash stacks report these)
+        if matches!(i.flow_control(), FlowControl::Call | FlowControl::IndirectCall) {
+            f.call_rets.push(i.next_ip() as u32);
+        }
         // references
         match i.flow_control() {
             FlowControl::Call => {

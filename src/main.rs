@@ -144,6 +144,20 @@ enum Cmd {
         #[arg(long, default_value_t = 2.0)]
         hi_score: f32,
     },
+    /// Write the static data of the exception translator web app (no database, no executables)
+    Webdata {
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        extract_dir: PathBuf,
+        /// labels/ directory of a match (or solve) run, for the stripped builds
+        #[arg(long)]
+        labels_dir: PathBuf,
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
+    },
     /// Show which functions of a reference build a target function's signatures point to
     Explain {
         #[arg(long)]
@@ -461,6 +475,10 @@ fn main() -> Result<()> {
             if !evals.is_empty() {
                 std::fs::write(out_dir.join("eval.json"), serde_json::to_string_pretty(&evals)?)?;
             }
+        }
+        Cmd::Webdata { corpus, extract_dir, labels_dir, out_dir, jobs } => {
+            let c: corpus::Corpus = serde_json::from_str(&std::fs::read_to_string(&corpus)?)?;
+            fnmatch::webdata::generate(&c, &extract_dir, &labels_dir, &out_dir, jobs)?;
         }
         Cmd::Explain { extract_dir, sig_dir, target, rva, reference } => {
             let b = model::Build::load(&extract_dir.join(format!("{}.fnx", target)))?;

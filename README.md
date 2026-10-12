@@ -52,6 +52,7 @@ stellar-fnmatch match ... --target-fnx new.fnx --out-dir runs/new
 stellar-fnmatch exceptions --corpus corpus.json --extract-dir extract --labels-dir runs/all/labels \
     --input <exception.txt dir> --out-dir <private dir>
 stellar-fnmatch info extract/<build>.fnx [--func <rva>|#<index>] [--dump-names]
+stellar-fnmatch webdata --corpus corpus.json --extract-dir extract --labels-dir runs/all/labels --out-dir webdata  # data for the web app
 ```
 
 Outputs are described in [SCHEMA.md](SCHEMA.md). `runs/<run>/export.csv` lists every labelled

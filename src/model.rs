@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BuildMeta {
@@ -135,6 +135,8 @@ pub struct Func {
     pub eh_parent: u32,
     /// 1 = unwind (destructor) funclet, 2 = catch funclet, 0 = not a funclet
     pub eh_kind: u8,
+    /// RVAs right after each call instruction (the return addresses a stack trace shows), sorted
+    pub call_rets: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

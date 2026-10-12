@@ -16,3 +16,4 @@ pub mod pdbnames;
 pub mod pe;
 pub mod sigs;
 pub mod solve;
+pub mod webdata;

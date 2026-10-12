@@ -17,6 +17,7 @@ addresses.
 import argparse
 import collections
 import csv
+import hashlib
 import json
 import os
 import subprocess
@@ -44,17 +45,27 @@ def load_labels(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--labels', required=True)
-    ap.add_argument('--export', required=True, help='export.csv of the same run (build id <-> exe md5)')
+    ap.add_argument('--export', help='export.csv of the same run (build id <-> exe md5); computed from corpus.json when absent')
     ap.add_argument('--gog-names-dir', required=True, help='<gog build id>.tsv from info --dump-names')
     ap.add_argument('--corpus', required=True)
     ap.add_argument('--out', required=True)
     a = ap.parse_args()
 
-    md5_to_build = {}
-    with open(a.export, newline='') as fh:
-        for row in csv.DictReader(fh):
-            md5_to_build[row['exe_md5']] = row['build_id']
     corpus = json.load(open(a.corpus))['builds']
+    md5_to_build = {}
+    if a.export:
+        with open(a.export, newline='') as fh:
+            for row in csv.DictReader(fh):
+                md5_to_build[row['exe_md5']] = row['build_id']
+    else:
+        db_versions = {r[0] for r in psql('select distinct version from versions')}
+        for b in corpus:
+            if b['platform'] == 'steam' and b['version'] in db_versions:
+                h = hashlib.md5()
+                with open(b['exe_path'], 'rb') as fh:
+                    for chunk in iter(lambda: fh.read(1 << 20), b''):
+                        h.update(chunk)
+                md5_to_build[h.hexdigest()] = b['id']
 
     versions = psql("select id, version, platform, md5 from versions where os = 'windows' order by id")
     by_ver = collections.defaultdict(dict)
@@ -88,7 +99,8 @@ def main():
         cols = ', '.join(HASHES)
         steam = psql('select addr, %s from fn2hash where version_id = %d' % (cols, svid))
         gog = psql('select addr, %s from fn2hash where version_id = %d' % (cols, gvid))
-        gsym = {int(r[0]) for r in psql('select addr from symbol_addr where version_id = %d' % gvid)}
+        gsym_name = {int(r[0]): r[1] for r in psql('select sa.addr, s.symbol from symbol_addr sa join symbols s on s.id = sa.symbol_id where sa.version_id = %d' % gvid)}
+        gsym = set(gsym_name)
         index = [collections.defaultdict(list) for _ in HASHES]
         for r in gog:
             for k in range(len(HASHES)):
@@ -96,6 +108,8 @@ def main():
 
         c = collections.Counter()
         samples = collections.defaultdict(list)
+        disagreements = []
+        agreed = []  # (steam va, gog va) where both methods give the same unique answer
         for r in steam:
             addr = int(r[0])
             c['steam_functions'] += 1
@@ -114,14 +128,26 @@ def main():
                 c['existing_unique' if len(cands) == 1 else 'existing_ambiguous'] += 1
             if label:
                 c['ours_answered'] += 1
-            if cands and label:
+            funclet_parent = None
+            if label and label[0].endswith((' [unwind funclet]', ' [catch funclet]')):
+                funclet_parent = label[0].rsplit(' [', 1)[0]
+            if cands and label and funclet_parent is not None:
+                # the existing method names the funclet itself ("`Parent'::`1'::dtor$N")
+                if any(gsym_name.get(g, '').startswith('`%s\'::' % funclet_parent) for g in cands):
+                    c['funclet_same_parent'] += 1
+                else:
+                    c['funclet_other_parent'] += 1
+            elif cands and label:
                 if our_gog & set(cands):
                     c['agree' if len(cands) == 1 else 'agree_with_one_of_ambiguous'] += 1
+                    if len(cands) == 1:
+                        agreed.append((addr, cands[0]))
                 elif not our_gog:
                     c['ours_name_not_in_gog'] += 1
                 else:
                     key = 'disagree_existing_unique' if len(cands) == 1 else 'disagree_existing_ambiguous'
                     c[key] += 1
+                    disagreements.append((key, addr, cands, sorted(our_gog)))
                     if len(samples[key]) < 15:
                         samples[key].append({'steam_va': hex(addr), 'existing_gog_va': [hex(x) for x in cands[:3]],
                                              'ours': label, 'ours_gog_va': [hex(x) for x in sorted(our_gog)[:3]]})
@@ -131,6 +157,23 @@ def main():
                 c['only_existing'] += 1
             else:
                 c['neither'] += 1
+        # Adjudicate disagreements by layout: the Steam and GOG builds of one version are the same
+        # commit and keep function order, so the Steam->GOG address offset changes slowly. The
+        # local offset is the median over the 20 nearest agreed functions; an answer "fits" when
+        # it lands within 0x2000 of where that offset puts the function.
+        agreed.sort()
+        keys = [s for s, _ in agreed]
+        import bisect
+        for key, addr, cands, ours_g in disagreements:
+            i = bisect.bisect_left(keys, addr)
+            near = agreed[max(0, i - 10):i + 10]
+            if not near:
+                continue
+            offs = sorted(g - s for s, g in near)
+            expect = addr + offs[len(offs) // 2]
+            fits_ours = any(abs(g - expect) < 0x2000 for g in ours_g)
+            fits_existing = any(abs(g - expect) < 0x2000 for g in cands)
+            c[key + ('_ours_fits' if fits_ours else '') + ('_existing_fits' if fits_existing else '') + ('' if fits_ours or fits_existing else '_neither_fits')] += 1
         # all functions of the Steam build in stellar-fnmatch's function list
         c['fnmatch_functions'] = sum(1 for _ in open(os.path.join(a.labels, sbuild + '.csv'))) - 1
         c['fnmatch_labelled'] = len(ours)

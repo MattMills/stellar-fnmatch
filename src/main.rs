@@ -144,6 +144,22 @@ enum Cmd {
         #[arg(long, default_value_t = 2.0)]
         hi_score: f32,
     },
+    /// Show which functions of a reference build a target function's signatures point to
+    Explain {
+        #[arg(long)]
+        extract_dir: PathBuf,
+        #[arg(long)]
+        sig_dir: PathBuf,
+        /// target build id
+        #[arg(long)]
+        target: String,
+        /// function RVAs in the target (hex, comma separated)
+        #[arg(long)]
+        rva: String,
+        /// reference build id (its .sig file)
+        #[arg(long)]
+        reference: String,
+    },
     /// Print statistics of extracted builds
     Info {
         files: Vec<PathBuf>,
@@ -446,6 +462,38 @@ fn main() -> Result<()> {
                 std::fs::write(out_dir.join("eval.json"), serde_json::to_string_pretty(&evals)?)?;
             }
         }
+        Cmd::Explain { extract_dir, sig_dir, target, rva, reference } => {
+            let b = model::Build::load(&extract_dir.join(format!("{}.fnx", target)))?;
+            let (cb, _) = fnmatch::corpusdb::compact(b, 0, &fnmatch::corpusdb::NameNorm::new());
+            let (ts, tf) = fnmatch::sigs::unique(fnmatch::sigs::free_signatures(&cb));
+            let r = fnmatch::sigs::SigFile::load(&sig_dir.join(format!("{}.sig", reference)))?;
+            for x in rva.split(',') {
+                let want = u32::from_str_radix(x.trim().trim_start_matches("0x"), 16)?;
+                let Some(fi) = cb.func_containing(want) else {
+                    println!("{:x}: no function", want);
+                    continue;
+                };
+                let mut hits: std::collections::BTreeMap<u32, Vec<u8>> = Default::default();
+                let mut n = 0;
+                for (k, &s) in ts.iter().enumerate() {
+                    if tf[k] as usize != fi {
+                        continue;
+                    }
+                    n += 1;
+                    if let Ok(j) = r.sigs.binary_search(&s) {
+                        hits.entry(r.funcs[j]).or_default().push(fnmatch::sigs::sig_kind(s));
+                    }
+                }
+                println!("{} {:x} (function {:x}, {} insns): {} unique signatures", target, want, cb.rva[fi], cb.n_insn[fi], n);
+                let mut v: Vec<(u32, Vec<u8>)> = hits.into_iter().collect();
+                v.sort_by(|a, c| c.1.len().cmp(&a.1.len()));
+                for (rf, kinds) in v.iter().take(5) {
+                    let names = &r.names[*rf as usize];
+                    let kn: Vec<String> = kinds.iter().map(|&k| fnmatch::sigs::kind::name(k)).collect();
+                    println!("    -> {} {:x}: {} signatures [{}] names: {}", reference, r.rva[*rf as usize], kinds.len(), kn.join(","), if names.is_empty() { "(no PDB name)".to_string() } else { names.join(" | ") });
+                }
+            }
+        }
         Cmd::Exceptions { corpus, extract_dir, labels_dir, input, out_dir, hi_score } => {
             let c: corpus::Corpus = serde_json::from_str(&std::fs::read_to_string(&corpus)?)?;
             let mut files = Vec::new();
@@ -563,6 +611,20 @@ fn main() -> Result<()> {
                         }
                         for s in &fx.strings {
                             println!("str: {:?}", b.strings[*s as usize]);
+                        }
+                        for r in &fx.refs {
+                            match r {
+                                model::Ref::CallImport(i) | model::Ref::JumpImport(i) => {
+                                    let im = &b.imports[*i as usize];
+                                    println!("import: {}!{}", im.dll, im.name);
+                                }
+                                model::Ref::Call(t) | model::Ref::Jump(t) => {
+                                    let cf = &b.funcs[*t as usize];
+                                    let nm = cf.names.first().map(|&k| b.names[k as usize].as_str()).unwrap_or("");
+                                    println!("callee: {:x} {}", cf.rva, nm);
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }

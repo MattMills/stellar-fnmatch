@@ -153,6 +153,40 @@ fn load_ctx(meta_id: &str, extract_dir: &Path, labels_dir: &Path) -> Result<Buil
     Ok(BuildCtx { build, image: pe.image, exports, labels })
 }
 
+/// Describe an unnamed function by its named neighbours: "[no name] calls A, B; called by C".
+fn context(c: &BuildCtx, k: usize) -> String {
+    use crate::model::Ref;
+    let name_of = |i: usize| c.labels.get(&c.build.funcs[i].rva).map(|l| l.label.split(" | ").next().unwrap_or("").to_string());
+    let mut calls: Vec<String> = Vec::new();
+    for r in &c.build.funcs[k].refs {
+        if let Ref::Call(t) | Ref::Jump(t) = r {
+            if let Some(n) = name_of(*t as usize) {
+                if !calls.contains(&n) && calls.len() < 3 {
+                    calls.push(n);
+                }
+            }
+        }
+    }
+    let mut callers: Vec<String> = Vec::new();
+    for (i, f) in c.build.funcs.iter().enumerate() {
+        if f.refs.iter().any(|r| matches!(r, Ref::Call(t) | Ref::Jump(t) if *t as usize == k)) {
+            if let Some(n) = name_of(i) {
+                if !callers.contains(&n) && callers.len() < 3 {
+                    callers.push(n);
+                }
+            }
+        }
+    }
+    let mut s = String::from("[no name]");
+    if !calls.is_empty() {
+        s += &format!(" calls {}", calls.join(", "));
+    }
+    if !callers.is_empty() {
+        s += &format!("{} called by {}", if calls.is_empty() { "" } else { ";" }, callers.join(", "));
+    }
+    s
+}
+
 pub fn run(corpus: &crate::corpus::Corpus, extract_dir: &Path, labels_dir: &Path, files: &[PathBuf], hi_score: f32) -> Result<(Vec<FrameOut>, BTreeMap<String, VersionSummary>)> {
     let mut reports: Vec<(usize, Report)> = Vec::new();
     for (i, f) in files.iter().enumerate() {
@@ -264,6 +298,7 @@ pub fn run(corpus: &crate::corpus::Corpus, extract_dir: &Path, labels_dir: &Path
                     }
                     None => {
                         out.status = "unlabelled".into();
+                        out.label = context(c, k);
                         all = false;
                         if first {
                             funcs_seen.insert((ci, fr), false);

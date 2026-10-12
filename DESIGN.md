@@ -136,3 +136,31 @@ binary is fine if load time matters).
 - Rust: rayon for per-build and per-key-type parallelism, memory-mapped inputs.
 - Shape: a core library crate plus a CLI with `ingest`, `solve`, `eval`, `index`, `match` (a new
   build against the index) and `export`.
+
+## Implementation notes (October 2026)
+
+What the data changed relative to the plan above:
+
+- **No Ghidra.** A native extractor (Rust, `iced-x86`, `pdb` crate) replaces the Ghidra export.
+  It covers all 242 x64 builds in about 10 minutes instead of about an hour per build, and its
+  function list (from `.pdata`, call/jump/pointer reachability and EH metadata) covers about 99%
+  of the non-funclet PDB procedures, against Ghidra's 65k of about 92k functions on stripped
+  builds.
+- **RTTI is mostly absent** (about 770 type descriptors, nearly all for exception types), so
+  vtables are found as tables of relocated code pointers whose address the code takes.
+- **C++ EH funclets matter for crash reports**: unwind funclets appear in many uploaded stacks.
+  They are found through the FH4 (`__CxxFrameHandler4`) and FH3 FuncInfo of every function and
+  inherit their owner's name.
+- **Per-executable signatures** (the user's refinement) instead of a global union-find: each
+  executable is evaluated once into a file of signatures unique inside it, and matching takes,
+  per function, the name with the most signatures. Relations without names are kept by
+  identifying a neighbour through one of its own unique signatures (its anchor).
+- **"Unique in every version" per signature**: a signature counts fully only when all PDB builds
+  that contain it agree on the name. Without that rule, layout and table-position signatures
+  of near-identical functions (static initializers, template instances) shift by one between
+  versions and produce most of the errors.
+- **Name normalization**: lambda hashes and anonymous-namespace hashes change between builds and
+  are normalized; some names are inherently unstable (counter-numbered `CONSOLEVAR_N`).
+- The corpus-wide solver (`solve`) is kept. On the 3.9 to 3.12 subset it reached similar accuracy;
+  it can also chain names through other stripped builds, which may help builds far from any PDB
+  build (2.4 to 2.8), but that has not been measured.

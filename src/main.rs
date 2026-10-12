@@ -117,6 +117,10 @@ enum Cmd {
         /// targets (comma separated); default: all builds without PDB names (or the holdouts)
         #[arg(long)]
         targets: Option<String>,
+        /// match one extract that is not in the corpus (e.g. a new patch, from extract-one); it is
+        /// placed after the newest build on the timeline
+        #[arg(long)]
+        target_fnx: Option<PathBuf>,
         #[arg(long)]
         params: Option<String>,
         #[arg(long, default_value_t = 8)]
@@ -146,6 +150,9 @@ enum Cmd {
         /// also print the function at this RVA (hex)
         #[arg(long)]
         func: Option<String>,
+        /// print rva and PDB names of every named function (tab separated) instead of statistics
+        #[arg(long)]
+        dump_names: bool,
         /// print a sample of N PDB procedures that are not extracted functions
         #[arg(long, default_value_t = 0)]
         unmatched: usize,
@@ -369,7 +376,7 @@ fn main() -> Result<()> {
                 })
             });
         }
-        Cmd::Match { corpus, extract_dir, sig_dir, out_dir, holdout, holdout_series, targets, params, load_threads } => {
+        Cmd::Match { corpus, extract_dir, sig_dir, out_dir, holdout, holdout_series, targets, target_fnx, params, load_threads } => {
             let c: corpus::Corpus = serde_json::from_str(&std::fs::read_to_string(&corpus)?)?;
             let holdout: Vec<String> = holdout.map(|s| s.split(',').map(|x| x.to_string()).collect()).unwrap_or_default();
             let series = |v: &str| v.split('.').take(2).collect::<Vec<_>>().join(".");
@@ -378,19 +385,31 @@ fn main() -> Result<()> {
             let ref_ids: Vec<(String, String, u16)> = c
                 .builds
                 .iter()
-                .filter(|b| b.pdb_path.is_some() && sig_dir.join(format!("{}.sig", b.id)).exists())
-                .filter(|b| !holdout.contains(&b.id) && !held_series.contains(&series(&b.version)))
-                .map(|b| (b.id.clone(), b.version.clone(), c.builds.iter().position(|x| x.id == b.id).unwrap() as u16))
+                .enumerate()
+                .filter(|(_, b)| b.pdb_path.is_some() && sig_dir.join(format!("{}.sig", b.id)).exists())
+                .filter(|(_, b)| !holdout.contains(&b.id) && !held_series.contains(&series(&b.version)))
+                .map(|(i, b)| (b.id.clone(), b.version.clone(), i as u16))
                 .collect();
             let t0 = std::time::Instant::now();
             let mut refs = fnmatch::matcher::RefSet::load(&sig_dir, &ref_ids, load_threads)?;
             let nsig: usize = refs.builds.iter().map(|r| r.sigs.len()).sum();
             eprintln!("loaded {} reference builds, {} signatures, {} names in {:.1}s", refs.builds.len(), nsig, refs.labels.names.len(), t0.elapsed().as_secs_f64());
-            let target_ids: Vec<String> = match targets {
-                Some(t) => t.split(',').map(|x| x.to_string()).collect(),
-                None if !holdout.is_empty() => holdout.clone(),
-                None => c.builds.iter().filter(|b| b.pdb_path.is_none() && extract_dir.join(format!("{}.fnx", b.id)).exists()).map(|b| b.id.clone()).collect(),
-            };
+            // (id, extract path, timeline position)
+            let mut target_list: Vec<(String, PathBuf, u16)> = Vec::new();
+            if let Some(p) = &target_fnx {
+                let id = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "target".into());
+                target_list.push((id, p.clone(), c.builds.len() as u16));
+            } else {
+                let ids: Vec<String> = match targets {
+                    Some(t) => t.split(',').map(|x| x.to_string()).collect(),
+                    None if !holdout.is_empty() => holdout.clone(),
+                    None => c.builds.iter().filter(|b| b.pdb_path.is_none() && extract_dir.join(format!("{}.fnx", b.id)).exists()).map(|b| b.id.clone()).collect(),
+                };
+                for id in ids {
+                    let pos = c.builds.iter().position(|x| x.id == id).unwrap_or(c.builds.len()) as u16;
+                    target_list.push((id.clone(), extract_dir.join(format!("{}.fnx", id)), pos));
+                }
+            }
             let p: fnmatch::matcher::MatchParams = match &params {
                 Some(js) => serde_json::from_str(js)?,
                 None => Default::default(),
@@ -399,14 +418,21 @@ fn main() -> Result<()> {
             let norm = fnmatch::corpusdb::NameNorm::new();
             let mut log = Vec::new();
             let mut evals = Vec::new();
-            for tid in &target_ids {
+            let mut export = std::io::BufWriter::new(std::fs::File::create(out_dir.join("export.csv"))?);
+            {
+                use std::io::Write;
+                writeln!(export, "build_id,version,platform,exe_md5,start_va,end_va,score,evidence,symbol")?;
+            }
+            for (tid, path, tpos) in &target_list {
                 let t1 = std::time::Instant::now();
-                let b = model::Build::load(&extract_dir.join(format!("{}.fnx", tid)))?;
+                let b = model::Build::load(path)?;
                 let has_pdb = b.has_pdb();
+                let image_base = b.image_base;
                 let (cb, names) = fnmatch::corpusdb::compact(b, 0, &norm);
-                let tpos = c.builds.iter().position(|x| &x.id == tid).unwrap_or(c.builds.len()) as u16;
-                let res = fnmatch::matcher::match_build(&mut refs, &cb, tpos, &p, &mut log);
-                fnmatch::matcher::write_labels(&refs, &cb, &res, &out_dir.join("labels").join(format!("{}.csv", tid)))?;
+                let res = fnmatch::matcher::match_build(&mut refs, &cb, *tpos, &p, &mut log);
+                let csv = out_dir.join("labels").join(format!("{}.csv", tid));
+                fnmatch::matcher::write_labels(&refs, &cb, &res, &csv)?;
+                fnmatch::matcher::append_export(&csv, &cb.meta, image_base, &mut export)?;
                 let accepted = res.iter().filter(|r| r.set != 0 && r.reject == 0).count();
                 eprintln!("{}: labelled {} of {} ({:.1}s)", tid, accepted, cb.n, t1.elapsed().as_secs_f64());
                 if has_pdb && holdout.contains(tid) {
@@ -483,9 +509,22 @@ fn main() -> Result<()> {
                 "total", tot.files, tot.frames, tot.frames_no_symbol, tot.frames_in_function, tot.frames_labelled, tot.frames_labelled_hi, tot.files_all_labelled, tot.distinct_functions, tot.distinct_labelled
             );
         }
-        Cmd::Info { files, func, unmatched } => {
+        Cmd::Info { files, func, unmatched, dump_names } => {
             for f in files {
                 let b = model::Build::load(&f)?;
+                if dump_names {
+                    // rva<TAB>normalized PDB names (joined with " | "), one function per line
+                    let norm = fnmatch::corpusdb::NameNorm::new();
+                    for f in &b.funcs {
+                        let mut v: Vec<String> = f.names.iter().filter_map(|&k| norm.norm(&b.names[k as usize])).collect();
+                        v.sort();
+                        v.dedup();
+                        if !v.is_empty() {
+                            println!("{:x}	{}", f.rva, v.join(" | "));
+                        }
+                    }
+                    continue;
+                }
                 println!("{}", summary(&b));
                 if unmatched > 0 {
                     let mut by_len: std::collections::BTreeMap<u32, u32> = Default::default();

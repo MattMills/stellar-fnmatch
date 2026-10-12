@@ -490,3 +490,23 @@ pub fn print_eval(e: &MatchEval) {
         println!("    ERR {}", s);
     }
 }
+
+/// Append the labelled rows of a labels CSV to the combined, DB-ready export (VAs, not RVAs).
+pub fn append_export(labels_csv: &Path, meta: &crate::model::BuildMeta, image_base: u64, w: &mut impl std::io::Write) -> Result<()> {
+    let txt = std::fs::read_to_string(labels_csv)?;
+    for line in txt.lines().skip(1) {
+        let mut it = line.splitn(8, ',');
+        let (Some(rva), Some(end), Some(_size), Some(score), Some(_second), Some(_round), Some(ev), Some(label)) =
+            (it.next(), it.next(), it.next(), it.next(), it.next(), it.next(), it.next(), it.next())
+        else {
+            continue;
+        };
+        if label == "\"\"" {
+            continue;
+        }
+        let rva = u64::from_str_radix(rva.trim_start_matches("0x"), 16).unwrap_or(0);
+        let end = u64::from_str_radix(end.trim_start_matches("0x"), 16).unwrap_or(0);
+        writeln!(w, "{},{},{},{},0x{:x},0x{:x},{},{},{}", meta.id, meta.version, meta.platform, meta.exe_md5, image_base + rva, image_base + end, score, ev, label)?;
+    }
+    Ok(())
+}

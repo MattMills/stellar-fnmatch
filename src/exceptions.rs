@@ -232,7 +232,25 @@ pub fn run(corpus: &crate::corpus::Corpus, extract_dir: &Path, labels_dir: &Path
                 let fr = c.build.funcs[k].rva;
                 out.func_rva = format!("0x{:x}", fr);
                 let first = !funcs_seen.contains_key(&(ci, fr));
-                match c.labels.get(&fr) {
+                // an EH funclet takes the name of the function that owns it
+                let mut via = c.labels.get(&fr).cloned();
+                if via.is_none() {
+                    let mut p = c.build.funcs[k].eh_parent;
+                    let kind = c.build.funcs[k].eh_kind;
+                    for _ in 0..4 {
+                        if p == u32::MAX {
+                            break;
+                        }
+                        let pf = &c.build.funcs[p as usize];
+                        if let Some(l) = c.labels.get(&pf.rva) {
+                            let what = if kind == crate::eh::KIND_CATCH { "catch funclet" } else { "unwind funclet" };
+                            via = Some(LabelRow { score: l.score, evidence: format!("eh_parent+{}", l.evidence), label: format!("{} [{}]", l.label, what) });
+                            break;
+                        }
+                        p = pf.eh_parent;
+                    }
+                }
+                match via.as_ref() {
                     Some(l) => {
                         s.frames_labelled += 1;
                         if l.score >= hi_score {

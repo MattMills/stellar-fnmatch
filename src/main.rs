@@ -82,6 +82,46 @@ enum Cmd {
         #[arg(long)]
         no_labels: bool,
     },
+    /// Evaluate each executable once into a signature file (.sig): functions, PDB names and every
+    /// signature that is unique inside that executable
+    Sigs {
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        extract_dir: PathBuf,
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(long)]
+        only: Option<String>,
+        #[arg(long, default_value_t = 2)]
+        jobs: usize,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Match stripped executables against the signature files of the PDB builds
+    Match {
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        extract_dir: PathBuf,
+        #[arg(long)]
+        sig_dir: PathBuf,
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// PDB builds to treat as stripped: they are matched and scored, and not used as references
+        #[arg(long)]
+        holdout: Option<String>,
+        /// with --holdout: also drop every reference build of the same version (major.minor)
+        #[arg(long)]
+        holdout_series: bool,
+        /// targets (comma separated); default: all builds without PDB names (or the holdouts)
+        #[arg(long)]
+        targets: Option<String>,
+        #[arg(long)]
+        params: Option<String>,
+        #[arg(long, default_value_t = 8)]
+        load_threads: usize,
+    },
     /// Resolve stellaris.exe frames of exception.txt files to labelled functions (end-to-end check)
     Exceptions {
         #[arg(long)]
@@ -145,8 +185,8 @@ fn summary(b: &model::Build) -> String {
     let s = &b.stats;
     let named = b.funcs.iter().filter(|f| !f.names.is_empty()).count();
     format!(
-        "{} v{} funcs={} (pdata {} leaf {}) pdata_entries={} chained={} unresolved_chain={} jt={} unres_ijmp={} interior={} bad={} strings={} vtables={} pdb_procs={} at_start={} inside={} outside={} named={} {:.1}s",
-        b.meta.id, b.meta.version, b.funcs.len(), s.funcs_pdata, s.funcs_leaf, s.pdata_entries, s.pdata_chained, s.pdata_chain_unresolved, s.jump_tables,
+        "{} v{} funcs={} (pdata {} leaf {} eh_funclets {} new {}) pdata_entries={} chained={} unresolved_chain={} jt={} unres_ijmp={} interior={} bad={} strings={} vtables={} pdb_procs={} at_start={} inside={} outside={} named={} {:.1}s",
+        b.meta.id, b.meta.version, b.funcs.len(), s.funcs_pdata, s.funcs_leaf, s.eh_funclets, s.eh_funclets_new, s.pdata_entries, s.pdata_chained, s.pdata_chain_unresolved, s.jump_tables,
         s.unresolved_indirect_jumps, s.interior_refs, s.bad_decodes, b.strings.len(), b.vtables.len(), s.pdb_procs, s.pdb_procs_at_func_start,
         s.pdb_procs_inside_func, s.pdb_procs_outside, named, s.seconds
     )
@@ -170,7 +210,25 @@ fn write_labels(s: &fnmatch::solve::Solver, dir: &Path) -> Result<()> {
                 a = Default::default();
             }
             let end = b.ranges.row(k).first().map_or(b.rva[k], |r| r.1);
-            let label = if a.set != 0 { db.labels.display(a.set).replace('"', "\"\"") } else { String::new() };
+            let mut label = if a.set != 0 { db.labels.display(a.set).replace('"', "\"\"") } else { String::new() };
+            // EH funclets take the name of the function that owns them
+            if a.set == 0 && b.eh_parent[k] != u32::MAX {
+                let mut p = b.eh_parent[k];
+                for _ in 0..4 {
+                    if p == u32::MAX {
+                        break;
+                    }
+                    let pa = s.assign[db.gid(bi, p as usize) as usize];
+                    if pa.set != 0 && pa.reject == fnmatch::solve::reject::NONE {
+                        let what = if b.eh_kind[k] == fnmatch::eh::KIND_CATCH { "catch funclet" } else { "unwind funclet" };
+                        label = format!("{} [{}]", db.labels.display(pa.set), what).replace('"', "\"\"");
+                        a = pa;
+                        a.types = 0;
+                        break;
+                    }
+                    p = b.eh_parent[p as usize];
+                }
+            }
             writeln!(
                 w,
                 "0x{:x},0x{:x},{},{:.3},{:.3},{},{},\"{}\"",
@@ -271,6 +329,95 @@ fn main() -> Result<()> {
             std::fs::write(out_dir.join("solve.log"), s.log.join("\n"))?;
             if !no_labels {
                 write_labels(&s, &out_dir.join("labels"))?;
+            }
+        }
+        Cmd::Sigs { corpus, extract_dir, out_dir, only, jobs, force } => {
+            let c: corpus::Corpus = serde_json::from_str(&std::fs::read_to_string(&corpus)?)?;
+            std::fs::create_dir_all(&out_dir)?;
+            let only: Option<Vec<String>> = only.map(|s| s.split(',').map(|x| x.to_string()).collect());
+            let todo: Vec<&model::BuildMeta> = c
+                .builds
+                .iter()
+                .filter(|b| only.as_ref().map_or(true, |o| o.contains(&b.id)))
+                .filter(|b| extract_dir.join(format!("{}.fnx", b.id)).exists())
+                .filter(|b| force || !out_dir.join(format!("{}.sig", b.id)).exists())
+                .collect();
+            eprintln!("{} builds to evaluate", todo.len());
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(jobs).build()?;
+            pool.install(|| {
+                todo.par_iter().for_each(|m| {
+                    let t0 = std::time::Instant::now();
+                    let r = model::Build::load(&extract_dir.join(format!("{}.fnx", m.id))).and_then(|b| {
+                        let s = fnmatch::sigs::evaluate(b);
+                        s.save(&out_dir.join(format!("{}.sig", m.id)))?;
+                        Ok(s)
+                    });
+                    match r {
+                        Ok(s) => {
+                            let named = s.names.iter().filter(|v| !v.is_empty()).count();
+                            let with_sig = {
+                                let mut v = vec![false; s.rva.len()];
+                                for &f in &s.funcs {
+                                    v[f as usize] = true;
+                                }
+                                v.iter().filter(|&&x| x).count()
+                            };
+                            eprintln!("{} v{}: funcs {} named {} sigs {} funcs with a unique sig {} ({:.1}s)", m.id, s.meta.version, s.rva.len(), named, s.sigs.len(), with_sig, t0.elapsed().as_secs_f64());
+                        }
+                        Err(e) => eprintln!("{} FAILED: {:#}", m.id, e),
+                    }
+                })
+            });
+        }
+        Cmd::Match { corpus, extract_dir, sig_dir, out_dir, holdout, holdout_series, targets, params, load_threads } => {
+            let c: corpus::Corpus = serde_json::from_str(&std::fs::read_to_string(&corpus)?)?;
+            let holdout: Vec<String> = holdout.map(|s| s.split(',').map(|x| x.to_string()).collect()).unwrap_or_default();
+            let series = |v: &str| v.split('.').take(2).collect::<Vec<_>>().join(".");
+            let held_series: std::collections::HashSet<String> =
+                if holdout_series { c.builds.iter().filter(|b| holdout.contains(&b.id)).map(|b| series(&b.version)).collect() } else { Default::default() };
+            let ref_ids: Vec<(String, String, u16)> = c
+                .builds
+                .iter()
+                .filter(|b| b.pdb_path.is_some() && sig_dir.join(format!("{}.sig", b.id)).exists())
+                .filter(|b| !holdout.contains(&b.id) && !held_series.contains(&series(&b.version)))
+                .map(|b| (b.id.clone(), b.version.clone(), c.builds.iter().position(|x| x.id == b.id).unwrap() as u16))
+                .collect();
+            let t0 = std::time::Instant::now();
+            let mut refs = fnmatch::matcher::RefSet::load(&sig_dir, &ref_ids, load_threads)?;
+            let nsig: usize = refs.builds.iter().map(|r| r.sigs.len()).sum();
+            eprintln!("loaded {} reference builds, {} signatures, {} names in {:.1}s", refs.builds.len(), nsig, refs.labels.names.len(), t0.elapsed().as_secs_f64());
+            let target_ids: Vec<String> = match targets {
+                Some(t) => t.split(',').map(|x| x.to_string()).collect(),
+                None if !holdout.is_empty() => holdout.clone(),
+                None => c.builds.iter().filter(|b| b.pdb_path.is_none() && extract_dir.join(format!("{}.fnx", b.id)).exists()).map(|b| b.id.clone()).collect(),
+            };
+            let p: fnmatch::matcher::MatchParams = match &params {
+                Some(js) => serde_json::from_str(js)?,
+                None => Default::default(),
+            };
+            std::fs::create_dir_all(out_dir.join("labels"))?;
+            let norm = fnmatch::corpusdb::NameNorm::new();
+            let mut log = Vec::new();
+            let mut evals = Vec::new();
+            for tid in &target_ids {
+                let t1 = std::time::Instant::now();
+                let b = model::Build::load(&extract_dir.join(format!("{}.fnx", tid)))?;
+                let has_pdb = b.has_pdb();
+                let (cb, names) = fnmatch::corpusdb::compact(b, 0, &norm);
+                let tpos = c.builds.iter().position(|x| &x.id == tid).unwrap_or(c.builds.len()) as u16;
+                let res = fnmatch::matcher::match_build(&mut refs, &cb, tpos, &p, &mut log);
+                fnmatch::matcher::write_labels(&refs, &cb, &res, &out_dir.join("labels").join(format!("{}.csv", tid)))?;
+                let accepted = res.iter().filter(|r| r.set != 0 && r.reject == 0).count();
+                eprintln!("{}: labelled {} of {} ({:.1}s)", tid, accepted, cb.n, t1.elapsed().as_secs_f64());
+                if has_pdb && holdout.contains(tid) {
+                    let e = fnmatch::matcher::evaluate(&refs, &cb, &names, &res);
+                    fnmatch::matcher::print_eval(&e);
+                    evals.push(e);
+                }
+            }
+            std::fs::write(out_dir.join("match.log"), log.join("\n"))?;
+            if !evals.is_empty() {
+                std::fs::write(out_dir.join("eval.json"), serde_json::to_string_pretty(&evals)?)?;
             }
         }
         Cmd::Exceptions { corpus, extract_dir, labels_dir, input, out_dir, hi_score } => {

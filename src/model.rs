@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::Path;
 
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BuildMeta {
@@ -56,6 +56,8 @@ pub mod ff {
     pub const BAD_DECODE: u16 = 1024;
     /// added only because the PDB says a procedure starts here (never used for stripped builds)
     pub const PDB_ONLY: u16 = 2048;
+    /// a C++ EH funclet listed in another function's FuncInfo
+    pub const EH_FUNCLET: u16 = 4096;
 }
 
 /// Kinds of outgoing references from a function, in address order.
@@ -128,6 +130,11 @@ pub struct Func {
     /// hash of the primary `.pdata` UNWIND_INFO (flags, prolog size, frame register, unwind codes),
     /// 0 for leaf functions
     pub h_unwind: u64,
+    /// for C++ EH funclets: index of the function whose FuncInfo lists this funclet (u32::MAX
+    /// otherwise)
+    pub eh_parent: u32,
+    /// 1 = unwind (destructor) funclet, 2 = catch funclet, 0 = not a funclet
+    pub eh_kind: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +186,9 @@ pub struct ExtractStats {
     pub pdb_procs_outside: u32,
     /// the PDB could not be read (the build is then treated as stripped)
     pub pdb_error: Option<String>,
+    /// C++ EH funclets found in FuncInfo metadata, and how many of them were new functions
+    pub eh_funclets: u32,
+    pub eh_funclets_new: u32,
     pub seconds: f64,
 }
 

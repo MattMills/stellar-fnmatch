@@ -76,6 +76,9 @@ pub struct CBuild {
     pub vcalls: Csr<u32>,
     /// for `jmp target` thunks (one instruction, a tail jump), the target
     pub thunk_to: Vec<u32>,
+    /// C++ EH funclets: owning function (u32::MAX otherwise) and kind (1 unwind, 2 catch)
+    pub eh_parent: Vec<u32>,
+    pub eh_kind: Vec<u8>,
     /// vtable slots (function index or u32::MAX)
     pub vtables: Vec<Vec<u32>>,
     /// data tables of code pointers (function index or u32::MAX)
@@ -209,7 +212,7 @@ fn dedup_keep_order<T: Copy + Eq + std::hash::Hash>(v: impl Iterator<Item = T>) 
 }
 
 /// Convert an extracted build into compact form; names are returned for global interning.
-fn compact(b: Build, idx: usize, norm: &NameNorm) -> (CBuild, Vec<Vec<String>>) {
+pub fn compact(b: Build, idx: usize, norm: &NameNorm) -> (CBuild, Vec<Vec<String>>) {
     let n = b.funcs.len();
     let has_pdb = b.has_pdb();
     let str_hash: Vec<u64> = b.strings.iter().map(|s| xxh3_64(s.as_bytes())).collect();
@@ -243,6 +246,8 @@ fn compact(b: Build, idx: usize, norm: &NameNorm) -> (CBuild, Vec<Vec<String>>) 
         globals: Csr::new(),
         vcalls: Csr::new(),
         thunk_to: vec![u32::MAX; n],
+        eh_parent: Vec::with_capacity(n),
+        eh_kind: Vec::with_capacity(n),
         vtables: b.vtables.iter().map(|v| v.slots.clone()).collect(),
         tables: b.tables.clone(),
         vtrefs: Csr::new(),
@@ -267,6 +272,8 @@ fn compact(b: Build, idx: usize, norm: &NameNorm) -> (CBuild, Vec<Vec<String>>) 
         c.h_bag.push(f.h_mnem_bag);
         c.h_cfg.push(f.h_cfg);
         c.h_unwind.push(f.h_unwind);
+        c.eh_parent.push(f.eh_parent);
+        c.eh_kind.push(f.eh_kind);
         c.blocks.push_row(f.blocks.iter().copied());
         c.strs.push_row(dedup_keep_order(f.strings.iter().map(|&s| str_hash[s as usize])));
         c.istrs.push_row(dedup_keep_order(f.istrings.iter().map(|&s| str_hash[s as usize])));

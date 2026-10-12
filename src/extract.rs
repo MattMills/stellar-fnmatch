@@ -820,6 +820,26 @@ pub fn extract(exe: &[u8], pdb: Option<&std::path::Path>, meta: BuildMeta) -> Re
             }
         }
     }
+    // C++ EH funclets from the FuncInfo of every function with a handler: (funclet, kind, parent)
+    let mut eh: Vec<(u32, u8, u32)> = Vec::new();
+    for rf in pe.pdata() {
+        if rf.flags & 0x4 != 0 || rf.flags & 0x3 == 0 {
+            continue;
+        }
+        for (r, k) in crate::eh::funclets(&pe, rf.unwind) {
+            if r != rf.begin {
+                eh.push((r, k, rf.begin));
+            }
+        }
+    }
+    eh.sort_unstable();
+    eh.dedup_by_key(|x| x.0);
+    stats.eh_funclets = eh.len() as u32;
+    for &(r, _, _) in &eh {
+        seeds.push((r, ff::EH_FUNCLET));
+    }
+    let npdata_starts: std::collections::HashSet<u32> = pe.pdata().iter().map(|r| r.begin).collect();
+    stats.eh_funclets_new = eh.iter().filter(|x| !npdata_starts.contains(&x.0)).count() as u32;
     let (ctx, funcs) = discover(&pe, &mut stats, import_by_iat.clone(), &seeds);
     // seed flags also apply to pdata functions
     let mut seed_flags: HashMap<u32, u16> = HashMap::new();
@@ -932,11 +952,19 @@ pub fn extract(exe: &[u8], pdb: Option<&std::path::Path>, meta: BuildMeta) -> Re
         .par_iter()
         .zip(decoded.par_iter())
         .map(|((e, rs, fl), d)| {
-            let mut f = Func { rva: *e, ranges: rs.clone(), flags: *fl, ..Default::default() };
+            let mut f = Func { rva: *e, ranges: rs.clone(), flags: *fl, eh_parent: u32::MAX, ..Default::default() };
             features(&fc, *e, d, &mut f);
             f
         })
         .collect();
+    for &(r, k, parent) in &eh {
+        if let (Some(&fi), Some(&pi)) = (func_index.get(&r), func_index.get(&parent)) {
+            let f = &mut out_funcs[fi as usize];
+            f.eh_parent = pi;
+            f.eh_kind = k;
+            f.flags |= ff::EH_FUNCLET;
+        }
+    }
     for d in &decoded {
         stats.jump_tables += d.jump_tables;
         stats.unresolved_indirect_jumps += d.unresolved;

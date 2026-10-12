@@ -24,17 +24,40 @@ pub struct Report {
     pub frames: Vec<Frame>,
 }
 
+/// Parse the `<symbol> (+ <offset>)` frames. 3.x reports have a module column
+/// (`  6    stellaris.exe   PHYSFS_writeUBE64 (+ 1204794)`); 4.x reports leave it empty
+/// (`  1                    PHYSFS_writeUBE64 (+ 4790264)`), so the module is taken only when the
+/// first word is a file name with an executable-module extension.
 pub fn parse(text: &str) -> Option<Report> {
     let re_ver = Regex::new(r"(?m)^Version:\s*(\S+)").unwrap();
-    let re_frame = Regex::new(r"(?m)^\s*(\d+)\s+(\S+)\s+(.*?)\s*\(\+\s*(\d+)\)\s*$").unwrap();
+    let re_frame = Regex::new(r"(?m)^\s*(\d+)\s+(.*?)\s*\(\s*\+\s*(\d+)\s*\)\s*$").unwrap();
+    let re_module = Regex::new(r"(?i)^(\S+\.(?:exe|dll|sys|drv|ocx|cpl))\s+(.*)$").unwrap();
     let version = re_ver.captures(text)?[1].trim().to_string();
     let frames = re_frame
         .captures_iter(text)
         .filter_map(|c| {
-            Some(Frame { index: c[1].parse().ok()?, module: c[2].to_string(), symbol: c[3].trim().to_string(), offset: c[4].parse().ok()? })
+            let head = c[2].trim();
+            let (module, symbol) = match re_module.captures(head) {
+                Some(m) => (m[1].to_string(), m[2].trim().to_string()),
+                None => (String::new(), head.to_string()),
+            };
+            if symbol.is_empty() {
+                return None;
+            }
+            Some(Frame { index: c[1].parse().ok()?, module, symbol, offset: c[3].parse().ok()? })
         })
         .collect();
     Some(Report { version, frames })
+}
+
+/// A stellaris.exe frame: its module is stellaris.exe, or the module column is empty and the
+/// symbol is one of its exports.
+pub fn is_game_frame(f: &Frame, exports: &HashMap<String, u32>) -> bool {
+    if f.module.is_empty() {
+        exports.contains_key(&f.symbol)
+    } else {
+        f.module.eq_ignore_ascii_case("stellaris.exe")
+    }
 }
 
 /// A label row from a solve's labels/<build>.csv
@@ -218,7 +241,8 @@ pub fn run(corpus: &crate::corpus::Corpus, extract_dir: &Path, labels_dir: &Path
         let mut funcs_seen: HashMap<(usize, u32), bool> = HashMap::new();
         for (fi, rep) in &reps {
             s.files += 1;
-            let frames: Vec<&Frame> = rep.frames.iter().filter(|f| f.module.eq_ignore_ascii_case("stellaris.exe")).collect();
+            // export names are the same in every build of a version
+            let frames: Vec<&Frame> = rep.frames.iter().filter(|f| is_game_frame(f, &ctxs[0].exports)).collect();
             // choose the build where the most return addresses follow a call
             let mut best: Option<(usize, usize)> = None;
             for (ci, c) in ctxs.iter().enumerate() {

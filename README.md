@@ -80,7 +80,38 @@ CRT initializer table.
 | Steam 2.3.3 (PDB) | 99.96% | 80.2% | 98.9% |
 
 Matching one executable takes 6 to 15 s once the 106 reference signature files (616M
-signatures, about 9 GB) are loaded.
+signatures, about 9 GB) are loaded; all 127 stripped executables take about 17 minutes.
+
+### Crash reports
+
+On the uploaded exception.txt files of the stellar-except web app (3.0.1 to 3.12.5; the files
+are private and not part of this repository), resolving each `stellaris.exe` frame (exported
+symbol + offset) in the matching executable:
+
+- 99.1% of the distinct functions that crash stacks pass through get a name (99.2% for 3.9 to
+  3.12.5, the versions the current translator does not cover), and 99.9% of the frames that
+  fall inside a function.
+- Reports for versions the Steam archive lacks (3.11.1, 3.11.2, 3.12.1 to 3.12.4) resolve to the
+  GOG executables, so they come from GOG installs and get exact PDB names.
+- The rest map with high confidence to functions that have no name in any PDB (statically
+  linked code without symbols, such as SDL's `WinMain` at the bottom of every main-thread
+  stack), or are Steam-only code without a PDB; those frames are described by their named
+  neighbours instead. Frames reported as `(function-name not available) (+ 0)` carry no
+  address and cannot be resolved by anything.
+
+### Against the existing fn2hash translation (stellar-fnaddr, 3.4.5 to 3.8.4)
+
+For Steam 3.8.4 (65,145 Ghidra functions in the database): both methods give the same GOG
+function for 50,671 (including 8,997 where the existing method had several equal-hash
+candidates and took an arbitrary one, and 12,892 EH funclets), and they disagree on 174. Steam
+and GOG builds of one version keep the function order, so the local Steam-to-GOG address offset
+says where the right answer must be: it supports stellar-fnmatch in 145 of the 174 and the
+existing method in 25. stellar-fnmatch labels 77,503 functions of that build (Ghidra created
+65,145), including about 2,900 Steam-only functions named from the 2.3.x Steam PDBs. The
+existing method answers 7,029 functions that stellar-fnmatch leaves unlabelled: for 4,962 of
+them several GOG functions share the hash and it takes an arbitrary one, and 2,067 are unique
+hash matches (a same-version bonus in the matcher could pick these up).
+`scripts/compare_fn2hash.py` reproduces this (read-only queries).
 
 ## License
 

@@ -97,7 +97,7 @@ def main():
         ours = load_labels(os.path.join(a.labels, sbuild + '.csv'))
 
         cols = ', '.join(HASHES)
-        steam = psql('select addr, %s from fn2hash where version_id = %d' % (cols, svid))
+        steam = psql('select addr, %s, num_instructions from fn2hash where version_id = %d' % (cols, svid))
         gog = psql('select addr, %s from fn2hash where version_id = %d' % (cols, gvid))
         gsym_name = {int(r[0]): r[1] for r in psql('select sa.addr, s.symbol from symbol_addr sa join symbols s on s.id = sa.symbol_id where sa.version_id = %d' % gvid)}
         gsym = set(gsym_name)
@@ -155,6 +155,9 @@ def main():
                 c['only_ours'] += 1
             elif cands:
                 c['only_existing'] += 1
+                c['only_existing_unique' if len(cands) == 1 else 'only_existing_ambiguous'] += 1
+                ninsn = int(r[-1])
+                c['only_existing_le5insn' if ninsn <= 5 else 'only_existing_gt5insn'] += 1
             else:
                 c['neither'] += 1
         # Adjudicate disagreements by layout: the Steam and GOG builds of one version are the same

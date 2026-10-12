@@ -90,7 +90,12 @@ Relations `r`: 0 callee ordinal (with the callee's shape), 1 caller (with the ca
 hash), 2 call set, 3 consecutive callee pair, 4 thunk target, 5 vtable slot (by slot 0 or by a
 function taking the vtable's address), 6/7 code-layout neighbour before/after (offset and own
 shape, reach 4), 8/9 data-table neighbour before/after, 10 shared writable global (ordinal and
-own shape), 11 function pointer taken.
+own shape), 11 function pointer taken. Relation kinds are named `a_<relation>` and
+`s_<relation>` (`a_callee_ord`, `s_vtslot`, ...).
+
+Text form (`sigs::format` / `sigs::parse`, used by lua_fnmatch): `<kind name>:<hash58 in 15 hex
+digits>`, e.g. `pic:2a9f0c1d3e4b5a6`. Signatures of the kinds str, istr, export, imm, const and
+s_thunk can also be computed from known facts (`sigs::facts`).
 
 ## Labels: `runs/<run>/labels/<build id>.csv` (`match`, `solve`)
 

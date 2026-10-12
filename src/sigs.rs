@@ -76,6 +76,10 @@ pub mod kind {
             format!("k{}", k)
         }
     }
+    /// inverse of `name`
+    pub fn from_name(s: &str) -> Option<u8> {
+        (0..64u8).find(|&k| name(k) == s && !name(k).starts_with('k'))
+    }
     /// code-shape kinds are dampened for tiny functions when matching
     pub fn code_shape(k: u8) -> bool {
         matches!(k, EXACT | PIC | MNEM | BAGCFG | CONST | IMM)
@@ -119,6 +123,86 @@ fn hseq(v: &[u64]) -> u64 {
 /// Hash of a symbol name as used inside symbol-relation signatures.
 pub fn name_hash(s: &str) -> u64 {
     xxh3_64_with_seed(s.as_bytes(), 0x5157)
+}
+
+/// A signature from its kind and hash (the hash is truncated to 58 bits).
+pub fn make(kind: u8, h: u64) -> u64 {
+    mk(kind, h)
+}
+
+/// Text form of a signature: `<kind name>:<58-bit hash in 15 hex digits>`, e.g.
+/// `pic:2a9f0c1d3e4b5a6`.
+pub fn format(s: u64) -> String {
+    format!("{}:{:015x}", kind::name(sig_kind(s)), s & HMASK)
+}
+
+/// Parses the text form of `format`, or 16 hex digits of the whole value (`0x` optional).
+pub fn parse(text: &str) -> std::result::Result<u64, String> {
+    let t = text.trim();
+    if let Some((k, h)) = t.split_once(':') {
+        let kd = kind::from_name(k).ok_or_else(|| format!("unknown signature kind '{}'", k))?;
+        let h = h.strip_prefix("0x").unwrap_or(h);
+        if h.is_empty() || h.len() > 15 || !h.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("bad signature hash '{}' (up to 15 hex digits)", h));
+        }
+        let v = u64::from_str_radix(h, 16).unwrap();
+        if v > HMASK {
+            return Err(format!("signature hash '{}' has more than 58 bits", h));
+        }
+        return Ok(mk(kd, v));
+    }
+    let h = t.strip_prefix("0x").unwrap_or(t);
+    if h.len() != 16 || !h.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("bad signature '{}' (expected kind:hash or 16 hex digits)", t));
+    }
+    let v = u64::from_str_radix(h, 16).unwrap();
+    if kind::from_name(&kind::name(sig_kind(v))).is_none() {
+        return Err(format!("bad signature '{}' (unknown kind {})", t, sig_kind(v)));
+    }
+    Ok(v)
+}
+
+/// Signatures that can be written down from facts about a function instead of being computed
+/// from its code. Like every signature, they identify a function only when they are unique in the
+/// executable.
+pub mod facts {
+    use super::{h2, kind, mk, name_hash};
+    use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
+
+    /// The function references this string literal (wide strings are written `L"text`, without
+    /// a closing quote, as in the extracts).
+    pub fn string(s: &str) -> u64 {
+        mk(kind::STR, xxh3_64(s.as_bytes()))
+    }
+    /// A data object the function references points to this string.
+    pub fn indirect_string(s: &str) -> u64 {
+        mk(kind::ISTR, xxh3_64(s.as_bytes()))
+    }
+    /// The function is exported under this name.
+    pub fn export(name: &str) -> u64 {
+        mk(kind::EXPORT, xxh3_64_with_seed(name.as_bytes(), 7))
+    }
+    /// The function uses this immediate (as the 64-bit value the decoder reports: sign-extended
+    /// immediates are sign-extended).
+    pub fn immediate(v: u64) -> u64 {
+        mk(kind::IMM, h2(v, 0))
+    }
+    /// The function loads this read-only data (the bytes of the memory operand, 1 to 32 bytes:
+    /// e.g. a float or a SIMD mask).
+    pub fn constant(bytes: &[u8]) -> Option<u64> {
+        if bytes.is_empty() || bytes.len() > 32 {
+            return None;
+        }
+        let mut buf = Vec::with_capacity(bytes.len() + 1);
+        buf.push(bytes.len() as u8);
+        buf.extend_from_slice(bytes);
+        Some(mk(kind::CONST, xxh3_64(&buf)))
+    }
+    /// The function is a one-instruction thunk that jumps to the function with this name (like
+    /// every symbol relation, it resolves once a function of the executable carries that name).
+    pub fn thunk_to(name: &str) -> u64 {
+        mk(kind::SYMBOL + kind::R_THUNK, name_hash(name))
+    }
 }
 
 /// Code and data signatures of one function.

@@ -12,6 +12,7 @@ pub mod eh;
 pub mod eval;
 pub mod exceptions;
 pub mod extract;
+pub mod fficheck;
 pub mod ffigen;
 pub mod matcher;
 pub mod model;

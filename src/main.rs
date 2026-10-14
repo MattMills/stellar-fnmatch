@@ -211,6 +211,24 @@ enum Cmd {
         #[arg(long)]
         report: Option<PathBuf>,
     },
+    /// Check the function declarations of `cdef` against the Linux build's symbols, the Windows
+    /// build's vftables and its code (docs/ffi.md)
+    FfiCheck {
+        #[arg(long)]
+        pdb: PathBuf,
+        /// the build's executable
+        #[arg(long)]
+        exe: PathBuf,
+        /// the build's extract (.fnx)
+        #[arg(long)]
+        fnx: PathBuf,
+        /// `nm -C --defined-only` output of the Linux build of the same version
+        #[arg(long)]
+        linux_nm: Option<PathBuf>,
+        /// JSON report
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
     /// Print statistics of extracted builds
     Info {
         files: Vec<PathBuf>,
@@ -633,6 +651,31 @@ fn main() -> Result<()> {
             if let Some(r) = report {
                 std::fs::write(r, serde_json::to_string_pretty(&g.report)?)?;
             }
+        }
+        Cmd::FfiCheck { pdb, exe, fnx, linux_nm, report } => {
+            use fnmatch::fficheck;
+            let t0 = std::time::Instant::now();
+            let info = fnmatch::pdbtypes::load(&pdb)?;
+            let db = fnmatch::cdef::Db::new(&info.tpi);
+            let funcs = fnmatch::cdecl::Funcs::new(&db);
+            let decls: Vec<fnmatch::cdecl::FuncDecl> = info.procs.iter().filter(|p| !fnmatch::ffigen::skip_proc(&p.name)).filter_map(|p| funcs.declare(p)).collect();
+            let b = model::Build::load(&fnx)?;
+            let pe = fnmatch::pe::Pe::parse(&std::fs::read(&exe)?)?;
+            eprintln!("{} declarations ({:.1}s)", decls.len(), t0.elapsed().as_secs_f64());
+            let lin = match &linux_nm {
+                Some(p) => Some(fficheck::check_linux(&decls, &std::fs::read_to_string(p)?)),
+                None => None,
+            };
+            let vt = fficheck::check_vtables(&info, &db, &funcs, &decls, &b, &pe);
+            let code = fficheck::check_code(&decls, &b, &pe);
+            let ret = fficheck::check_returns(&db, &funcs, &decls);
+            let thr = fficheck::check_throws(&b);
+            println!("{}", fficheck::summary_text(lin.as_ref(), &vt, &code, &ret, &thr));
+            if let Some(r) = report {
+                let j = serde_json::json!({ "linux": lin, "vtables": vt, "code": code, "returns": ret, "throws": thr });
+                std::fs::write(r, serde_json::to_string_pretty(&j)?)?;
+            }
+            eprintln!("done in {:.1}s", t0.elapsed().as_secs_f64());
         }
         Cmd::Info { files, func, unmatched, dump_names } => {
             for f in files {

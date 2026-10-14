@@ -27,6 +27,8 @@ pub struct Param {
     pub pass: &'static str,
     /// category for the cross-check: p, pc, r, rc, rr, v, e, m, f:<kind>
     pub cat: String,
+    /// for `copy`: why the class is not passed in a register ("size" or "nontrivial")
+    pub why: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +38,8 @@ pub struct Virt {
     pub slot: u32,
     pub intro: u32,
     pub pure: bool,
+    /// a virtual destructor: the slot holds the deleting destructor, `void *(C *, uint32_t flags)`
+    pub deleting: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +79,8 @@ pub struct Funcs<'a, 'b> {
     pub db: &'b Db<'a>,
     /// (class definition, method name) -> declarations in the class
     pub methods: HashMap<(u32, String), Vec<MethodRec>>,
+    /// destructors declared in each class
+    dtors: HashMap<u32, Vec<MethodRec>>,
     triv_copy: std::cell::RefCell<HashMap<u32, bool>>,
     pod: std::cell::RefCell<HashMap<u32, bool>>,
 }
@@ -121,7 +127,13 @@ impl<'a, 'b> Funcs<'a, 'b> {
                 }
             }
         }
-        Funcs { db, methods, triv_copy: Default::default(), pod: Default::default() }
+        let mut dtors: HashMap<u32, Vec<MethodRec>> = HashMap::new();
+        for ((c, n), v) in &methods {
+            if n.starts_with('~') {
+                dtors.entry(*c).or_default().extend(v.iter().copied());
+            }
+        }
+        Funcs { db, methods, dtors, triv_copy: Default::default(), pod: Default::default() }
     }
 
     fn class_fields(&self, d: u32) -> Vec<&'a Field> {
@@ -132,6 +144,11 @@ impl<'a, 'b> Funcs<'a, 'b> {
     }
 
     /// Is `ti` an lvalue or rvalue reference to (cv) class `d`?
+    /// Is `ti` an lvalue reference to (cv) class `d`?
+    fn is_lref_to(&self, ti: u32, d: u32) -> bool {
+        matches!(self.db.t.get(ti), Some(Rec::Pointer { attr, .. }) if Rec::ptr_mode(*attr) == pm::LREF) && self.is_ref_to(ti, d)
+    }
+
     fn is_ref_to(&self, ti: u32, d: u32) -> bool {
         if let Some(Rec::Pointer { referent, attr, .. }) = self.db.t.get(ti) {
             if matches!(Rec::ptr_mode(*attr), pm::LREF | pm::RREF) {
@@ -150,7 +167,11 @@ impl<'a, 'b> Funcs<'a, 'b> {
             })
     }
 
-    /// Copy/move constructors declared in the class (user-declared, or generated and emitted).
+    /// Copy constructors (`C(C&)`, `C(const C&)`) the class declares. Move constructors do not
+    /// count: the GOG 4.5.2 call sites pass small classes that only declare one (`TPdxRef<T>`,
+    /// `CSimpleBitMask<E>`) in a register, and those with a copy constructor (`CPdxPtr<T>`,
+    /// `fpml::fixed_point`) by address (docs/ffi.md). Compiler-generated ones are judged through
+    /// the members and bases.
     fn copy_ctors(&self, d: u32) -> usize {
         let mut n = 0;
         for f in self.class_fields(d) {
@@ -163,12 +184,12 @@ impl<'a, 'b> Funcs<'a, 'b> {
                 _ => vec![],
             };
             for (attr, ty) in tys {
-                if attr.pseudo() {
+                if attr.pseudo() || attr.compgenx() {
                     continue;
                 }
                 if let Some(Rec::MFunction { fattr, args, .. }) = self.db.t.get(ty) {
                     let a = self.db.t.args(*args);
-                    if fattr.ctor() && a.len() == 1 && self.is_ref_to(a[0], d) {
+                    if fattr.ctor() && a.len() == 1 && self.is_lref_to(a[0], d) {
                         n += 1;
                     }
                 }
@@ -313,7 +334,7 @@ impl<'a, 'b> Funcs<'a, 'b> {
                     return None;
                 }
                 if let (true, Some(off)) = (m.attr.is_intro(), m.vtoff) {
-                    return Some(Virt { vfptr: self.primary_vfptr(d, 0)?, slot: off / 8, intro: d, pure: m.attr.is_pure() });
+                    return Some(Virt { vfptr: self.primary_vfptr(d, 0)?, slot: off / 8, intro: d, pure: m.attr.is_pure(), deleting: name.starts_with('~') || name == "__vecDelDtor" });
                 }
             }
         }
@@ -333,6 +354,57 @@ impl<'a, 'b> Funcs<'a, 'b> {
             }
         }
         None
+    }
+
+    /// The slot of the deleting destructor of `d`: its own `__vecDelDtor`, or that of the base
+    /// whose vfptr is the primary one.
+    ///
+    /// MSVC lists `__vecDelDtor` as introduced in every class that has one, but the slot is in the
+    /// vftable of the first base (by offset) that already has a virtual destructor; only a class
+    /// none of whose bases has one introduces it, in its primary vftable.
+    pub fn dtor_slot(&self, d: u32, depth: usize) -> Option<Virt> {
+        if depth > 32 {
+            return None;
+        }
+        let mut bases: Vec<(u64, u32)> = self
+            .class_fields(d)
+            .iter()
+            .filter_map(|f| match f {
+                Field::Base { ty, offset, .. } => self.db.def_of(*ty).map(|b| (*offset, b)),
+                _ => None,
+            })
+            .collect();
+        bases.sort();
+        for (o, b) in bases {
+            if self.has_virtual_dtor(b, depth + 1) {
+                if let Some(mut v) = self.dtor_slot(b, depth + 1) {
+                    v.vfptr += o;
+                    return Some(v);
+                }
+            }
+        }
+        let own = self.methods.get(&(d, "__vecDelDtor".to_string())).into_iter().flatten().chain(
+            self.dtors.get(&d).into_iter().flatten(),
+        );
+        for m in own {
+            if let (true, Some(off)) = (m.attr.is_intro(), m.vtoff) {
+                let pure = self.dtors.get(&d).map_or(false, |v| v.iter().any(|x| x.attr.is_pure()));
+                return Some(Virt { vfptr: self.primary_vfptr(d, 0)?, slot: off / 8, intro: d, pure, deleting: true });
+            }
+        }
+        None
+    }
+
+    /// Does the class or one of its bases declare a virtual destructor?
+    pub fn has_virtual_dtor(&self, d: u32, depth: usize) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        let own = self.methods.get(&(d, "__vecDelDtor".to_string())).map_or(false, |v| v.iter().any(|m| m.attr.is_virtual())) || self.dtors.get(&d).map_or(false, |v| v.iter().any(|m| m.attr.is_virtual()));
+        own || self.class_fields(d).iter().any(|f| match f {
+            Field::Base { ty, .. } => self.db.def_of(*ty).map_or(false, |b| self.has_virtual_dtor(b, depth + 1)),
+            _ => false,
+        })
     }
 
     /// The base class (path from `d`) whose subobject starts `adjust` bytes into `d` and has a
@@ -358,6 +430,8 @@ impl<'a, 'b> Funcs<'a, 'b> {
             Some(Rec::Pointer { referent, attr, .. }) => {
                 let mode = Rec::ptr_mode(*attr);
                 let (r, rc) = self.db.strip(*referent);
+                // a const pointer is const in the pointer record, not in a modifier
+                let rc = rc || matches!(self.db.t.get(r), Some(Rec::Pointer { attr: pa, .. }) if Rec::ptr_const(*pa));
                 match mode {
                     pm::PMEM | pm::PMFUNC => {
                         let s = self.db.size_of(t).unwrap_or(8);
@@ -509,27 +583,42 @@ impl<'a, 'b> Funcs<'a, 'b> {
             let cpp = db.cpp(a);
             let (c, cat, mut pass, by_value) = self.arg(a, &mut d);
             let mut c = c.unconst();
+            let mut why = "";
             if let Some(def) = by_value {
                 let size = db.size_of(def).unwrap_or(0);
-                let direct = matches!(size, 1 | 2 | 4 | 8) && self.trivially_copyable(def);
+                let small = matches!(size, 1 | 2 | 4 | 8);
+                let direct = small && self.trivially_copyable(def);
                 if !direct {
-                    let why = if !matches!(size, 1 | 2 | 4 | 8) { format!("{} bytes", size) } else { "not trivially copyable".to_string() };
-                    rewrites.push(format!("parameter {} {}: by value ({}), so a pointer to a copy the caller makes; the callee destroys it", i + 1, cpp, why));
+                    why = if small { "nontrivial" } else { "size" };
+                    let w = if !small { format!("{} bytes", size) } else { "not trivially copyable".to_string() };
+                    rewrites.push(format!("parameter {} {}: by value ({}), so a pointer to a copy the caller makes; the callee destroys it", i + 1, cpp, w));
                     c = CT::ptr(c);
                     pass = "copy";
                 }
             }
-            params.push(Param { cpp, c: c.decl(""), pass, cat });
+            params.push(Param { cpp, c: c.decl(""), pass, cat, why });
             params_c.push(c);
         }
         if va {
-            rewrites.push("variadic: float and double arguments must also be passed as their bits in integer form (MSVC reads them from both registers); prefer fixed arguments".into());
+            rewrites.push("variadic: LuaJIT passes Lua numbers as double and mirrors the vararg registers in both register sets, as MSVC expects".into());
         }
 
         let virt = match (class, &mname, mrec) {
+            // a virtual destructor's slot holds the deleting destructor (`__vecDelDtor` in the
+            // class's method list), whose name does not change from base to derived class
+            (Some(c), Some(m), Some(r)) if r.attr.is_virtual() && (m.starts_with('~') || m == "__vecDelDtor") => self.dtor_slot(c, 0),
             (Some(c), Some(m), Some(r)) if r.attr.is_virtual() => self.virt(c, m, p.ty, 0),
             _ => None,
         };
+        if let Some(v) = &virt {
+            if v.deleting {
+                rewrites.push(format!(
+                    "virtual destructor: slot {} holds the deleting destructor, void *(*)({} *, uint32_t flags), flags 1 = free the memory (fnmatch.ffi's vcall knows)",
+                    v.slot,
+                    db.cname[&class.unwrap()]
+                ));
+            }
+        }
         let f = CT::Func { ret: Box::new(ret_ct.clone()), params: params_c, va };
         let decl = CT::ptr(f).decl("");
         let cpp = format!(

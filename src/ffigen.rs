@@ -86,7 +86,7 @@ fn list(db: &Db, v: &BTreeSet<u32>) -> String {
 }
 
 /// Is this a C++ EH funclet or another name no caller wants?
-fn skip_proc(name: &str) -> bool {
+pub fn skip_proc(name: &str) -> bool {
     name.contains("dtor$") || name.contains("catch$") || name.contains("::`1'::") || name.starts_with("`") || name.contains("fin$") || name.contains("filt$")
 }
 

@@ -174,6 +174,43 @@ enum Cmd {
         #[arg(long)]
         reference: String,
     },
+    /// LuaJIT FFI declarations (a Lua module) of classes and functions of a PDB build, with
+    /// everything they need (docs/ffi.md)
+    Cdef {
+        /// the build's PDB
+        #[arg(long)]
+        pdb: PathBuf,
+        /// the build's extract (.fnx): build identity and which functions may throw
+        #[arg(long)]
+        fnx: Option<PathBuf>,
+        /// output Lua module
+        #[arg(long)]
+        out: PathBuf,
+        /// classes by C++ name (comma separated; names with commas: --classes-file)
+        #[arg(long)]
+        classes: Option<String>,
+        /// file with class names, one per line
+        #[arg(long)]
+        classes_file: Option<PathBuf>,
+        /// functions by PDB name (comma separated)
+        #[arg(long)]
+        functions: Option<String>,
+        /// file with function names: one per line, or a Lua list with `name = "..."` entries
+        #[arg(long)]
+        functions_file: Option<PathBuf>,
+        /// every class, struct, union and enum
+        #[arg(long)]
+        all_classes: bool,
+        /// every function with a type
+        #[arg(long)]
+        all_functions: bool,
+        /// leave out the member lists
+        #[arg(long)]
+        no_fields: bool,
+        /// write the generation report (JSON) here
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
     /// Print statistics of extracted builds
     Info {
         files: Vec<PathBuf>,
@@ -574,6 +611,28 @@ fn main() -> Result<()> {
                 "{:>8} {:>5} {:>6} {:>7} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9}",
                 "total", tot.files, tot.frames, tot.frames_no_symbol, tot.frames_in_function, tot.frames_labelled, tot.frames_labelled_hi, tot.files_all_labelled, tot.distinct_functions, tot.distinct_labelled
             );
+        }
+        Cmd::Cdef { pdb, fnx, out, classes, classes_file, functions, functions_file, all_classes, all_functions, no_fields, report } => {
+            let split = |s: Option<String>| -> Vec<String> { s.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default() };
+            let mut opts = fnmatch::ffigen::Options { classes: split(classes), functions: split(functions), all_classes, all_functions, no_fields };
+            if let Some(f) = classes_file {
+                opts.classes.extend(std::fs::read_to_string(&f)?.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && !l.starts_with('#')));
+            }
+            if let Some(f) = functions_file {
+                opts.functions.extend(fnmatch::ffigen::read_names(&std::fs::read_to_string(&f)?));
+            }
+            let b = match &fnx {
+                Some(p) => Some(model::Build::load(p)?),
+                None => None,
+            };
+            let t0 = std::time::Instant::now();
+            let g = fnmatch::ffigen::generate(&pdb, b.as_ref(), &opts)?;
+            std::fs::write(&out, &g.text)?;
+            eprintln!("{}: {} bytes in {:.1}s", out.display(), g.text.len(), t0.elapsed().as_secs_f64());
+            eprintln!("{}", serde_json::to_string_pretty(&g.report)?);
+            if let Some(r) = report {
+                std::fs::write(r, serde_json::to_string_pretty(&g.report)?)?;
+            }
         }
         Cmd::Info { files, func, unmatched, dump_names } => {
             for f in files {

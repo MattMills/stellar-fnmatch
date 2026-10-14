@@ -55,7 +55,23 @@ stellar-fnmatch info extract/<build>.fnx [--func <rva>|#<index>] [--dump-names]
 stellar-fnmatch webdata --corpus corpus.json --extract-dir extract --labels-dir runs/all/labels --out-dir webdata  # data for the web app
 ```
 
-Outputs are described in [SCHEMA.md](SCHEMA.md). `runs/<run>/export.csv` lists every labelled
+Outputs are described in [SCHEMA.md](SCHEMA.md).
+
+### LuaJIT FFI declarations
+
+```
+stellar-fnmatch cdef --pdb stellaris.pdb --fnx gog-4.5.2.fnx --exe stellaris.exe \
+    --classes CNamedColor --functions-file functions.lua --out gog-4.5.2.ffi.lua
+stellar-fnmatch ffi-check --pdb stellaris.pdb --exe stellaris.exe --fnx gog-4.5.2.fnx --linux-nm linux.nm
+```
+
+`cdef` writes a Lua module of LuaJIT FFI declarations from a PDB: every class asked for (or all
+of them) with each data member at its PDB offset and the types it needs, and a C declaration of
+every function that follows the MSVC x64 calling convention, with vtable slots and which functions
+may throw. lua_fnmatch's `fnmatch.ffi` loads it. On GOG 4.5.2, all 91,816 types (210,255 members)
+match the PDB under LuaJIT on Linux and Windows, all 136,050 declarations parse, 99.87% of the
+functions paired with the Linux build agree in every parameter, and 99.35% of 39,508 vtable slots
+hold the method. [docs/ffi.md](docs/ffi.md) has the rules and the validation. `runs/<run>/export.csv` lists every labelled
 function of every target with virtual addresses, ready to load into a database table.
 
 ## Results

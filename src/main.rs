@@ -174,6 +174,68 @@ enum Cmd {
         #[arg(long)]
         reference: String,
     },
+    /// LuaJIT FFI declarations (a Lua module) of classes and functions of a PDB build, with
+    /// everything they need (docs/ffi.md)
+    Cdef {
+        /// the build's PDB
+        #[arg(long)]
+        pdb: PathBuf,
+        /// the build's extract (.fnx): build identity and which functions may throw
+        #[arg(long)]
+        fnx: Option<PathBuf>,
+        /// the build's executable: the code decides how the classes the PDB is ambiguous about are
+        /// passed by value (a move constructor, no copy constructor listed)
+        #[arg(long)]
+        exe: Option<PathBuf>,
+        /// prefix of every C name
+        #[arg(long)]
+        prefix: Option<String>,
+        /// output Lua module
+        #[arg(long)]
+        out: PathBuf,
+        /// classes by C++ name (comma separated; names with commas: --classes-file)
+        #[arg(long)]
+        classes: Option<String>,
+        /// file with class names, one per line
+        #[arg(long)]
+        classes_file: Option<PathBuf>,
+        /// functions by PDB name (comma separated)
+        #[arg(long)]
+        functions: Option<String>,
+        /// file with function names: one per line, or a Lua list with `name = "..."` entries
+        #[arg(long)]
+        functions_file: Option<PathBuf>,
+        /// every class, struct, union and enum
+        #[arg(long)]
+        all_classes: bool,
+        /// every function with a type
+        #[arg(long)]
+        all_functions: bool,
+        /// leave out the member lists
+        #[arg(long)]
+        no_fields: bool,
+        /// write the generation report (JSON) here
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
+    /// Check the function declarations of `cdef` against the Linux build's symbols, the Windows
+    /// build's vftables and its code (docs/ffi.md)
+    FfiCheck {
+        #[arg(long)]
+        pdb: PathBuf,
+        /// the build's executable
+        #[arg(long)]
+        exe: PathBuf,
+        /// the build's extract (.fnx)
+        #[arg(long)]
+        fnx: PathBuf,
+        /// `nm -C --defined-only` output of the Linux build of the same version
+        #[arg(long)]
+        linux_nm: Option<PathBuf>,
+        /// JSON report
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
     /// Print statistics of extracted builds
     Info {
         files: Vec<PathBuf>,
@@ -574,6 +636,54 @@ fn main() -> Result<()> {
                 "{:>8} {:>5} {:>6} {:>7} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9}",
                 "total", tot.files, tot.frames, tot.frames_no_symbol, tot.frames_in_function, tot.frames_labelled, tot.frames_labelled_hi, tot.files_all_labelled, tot.distinct_functions, tot.distinct_labelled
             );
+        }
+        Cmd::Cdef { pdb, fnx, exe, prefix, out, classes, classes_file, functions, functions_file, all_classes, all_functions, no_fields, report } => {
+            let split = |s: Option<String>| -> Vec<String> { s.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default() };
+            let mut opts = fnmatch::ffigen::Options { classes: split(classes), functions: split(functions), all_classes, all_functions, no_fields, exe, prefix: prefix.unwrap_or_default() };
+            if let Some(f) = classes_file {
+                opts.classes.extend(std::fs::read_to_string(&f)?.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && !l.starts_with('#')));
+            }
+            if let Some(f) = functions_file {
+                opts.functions.extend(fnmatch::ffigen::read_names(&std::fs::read_to_string(&f)?));
+            }
+            let b = match &fnx {
+                Some(p) => Some(model::Build::load(p)?),
+                None => None,
+            };
+            let t0 = std::time::Instant::now();
+            let g = fnmatch::ffigen::generate(&pdb, b.as_ref(), &opts)?;
+            std::fs::write(&out, &g.text)?;
+            eprintln!("{}: {} bytes in {:.1}s", out.display(), g.text.len(), t0.elapsed().as_secs_f64());
+            eprintln!("{}", serde_json::to_string_pretty(&g.report)?);
+            if let Some(r) = report {
+                std::fs::write(r, serde_json::to_string_pretty(&g.report)?)?;
+            }
+        }
+        Cmd::FfiCheck { pdb, exe, fnx, linux_nm, report } => {
+            use fnmatch::fficheck;
+            let t0 = std::time::Instant::now();
+            let info = fnmatch::pdbtypes::load(&pdb)?;
+            let db = fnmatch::cdef::Db::new(&info.tpi);
+            let mut funcs = fnmatch::cdecl::Funcs::new(&db);
+            let pe = fnmatch::pe::Pe::parse(&std::fs::read(&exe)?)?;
+            funcs.learn(&info.procs, &pe);
+            let decls: Vec<fnmatch::cdecl::FuncDecl> = info.procs.iter().filter(|p| !fnmatch::ffigen::skip_proc(&p.name)).filter_map(|p| funcs.declare(p)).collect();
+            let b = model::Build::load(&fnx)?;
+            eprintln!("{} declarations ({:.1}s)", decls.len(), t0.elapsed().as_secs_f64());
+            let lin = match &linux_nm {
+                Some(p) => Some(fficheck::check_linux(&decls, &std::fs::read_to_string(p)?)),
+                None => None,
+            };
+            let vt = fficheck::check_vtables(&info, &db, &funcs, &decls, &b, &pe);
+            let code = fficheck::check_code(&decls, &b, &pe);
+            let ret = fficheck::check_returns(&db, &funcs, &decls);
+            let thr = fficheck::check_throws(&b);
+            println!("{}", fficheck::summary_text(lin.as_ref(), &vt, &code, &ret, &thr));
+            if let Some(r) = report {
+                let j = serde_json::json!({ "linux": lin, "vtables": vt, "code": code, "returns": ret, "throws": thr });
+                std::fs::write(r, serde_json::to_string_pretty(&j)?)?;
+            }
+            eprintln!("done in {:.1}s", t0.elapsed().as_secs_f64());
         }
         Cmd::Info { files, func, unmatched, dump_names } => {
             for f in files {

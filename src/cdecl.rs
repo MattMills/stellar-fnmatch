@@ -68,6 +68,106 @@ pub struct FuncDecl {
     pub rewrites: Vec<String>,
 }
 
+/// How a class of 1, 2, 4 or 8 bytes is passed by value (the worst of its parts wins)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Passing {
+    Register,
+    Unknown,
+    Address,
+}
+
+const ARG_REGS: [iced_x86::Register; 4] = [iced_x86::Register::RCX, iced_x86::Register::RDX, iced_x86::Register::R8, iced_x86::Register::R9];
+
+/// Does the function at `rva` use its argument register `reg` as an address (Some(true)) or as a
+/// value (Some(false))? Follows copies of the register, stops at its first telling use.
+pub fn first_use(pe: &crate::pe::Pe, rva: u32, len: u32, reg: iced_x86::Register) -> Option<bool> {
+    use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register};
+    let s = rva as usize;
+    let e = (rva as usize + (len.max(16) as usize).min(256)).min(pe.image.len());
+    if s >= e {
+        return None;
+    }
+    let mut d = Decoder::with_ip(64, &pe.image[s..e], rva as u64, DecoderOptions::NONE);
+    let mut aliases: Vec<Register> = vec![reg];
+    let mut fac = InstructionInfoFactory::new();
+    let mut i = Instruction::default();
+    for _ in 0..64 {
+        if !d.can_decode() {
+            break;
+        }
+        d.decode_out(&mut i);
+        if i.is_invalid() {
+            return None;
+        }
+        let full = |r: Register| r.full_register();
+        let is_alias = |r: Register| r != Register::None && aliases.contains(&full(r));
+        // a memory operand built on it: an address
+        let mem = (0..i.op_count()).any(|k| i.op_kind(k) == OpKind::Memory);
+        if mem && i.mnemonic() != Mnemonic::Lea && (is_alias(i.memory_base()) || is_alias(i.memory_index())) {
+            return Some(true);
+        }
+        if i.mnemonic() == Mnemonic::Lea && (is_alias(i.memory_base()) || is_alias(i.memory_index())) {
+            if i.op0_register().size() == 8 && i.memory_index() == Register::None {
+                aliases.push(full(i.op0_register())); // pointer arithmetic, follow it
+                continue;
+            }
+            return Some(false); // arithmetic on a value (lea eax, [rcx+rcx*4])
+        }
+        match i.flow_control() {
+            FlowControl::Return | FlowControl::UnconditionalBranch | FlowControl::IndirectBranch => return None,
+            FlowControl::Call | FlowControl::IndirectCall => {
+                // the call reads it: no telling; volatile registers die
+                aliases.retain(|r| !matches!(r, Register::RAX | Register::RCX | Register::RDX | Register::R8 | Register::R9 | Register::R10 | Register::R11));
+                if aliases.is_empty() {
+                    return None;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        // copies: mov r64, alias
+        if i.mnemonic() == Mnemonic::Mov && i.op_count() == 2 && i.op0_kind() == OpKind::Register && i.op1_kind() == OpKind::Register && is_alias(i.op1_register()) {
+            if i.op1_register().size() == 8 {
+                aliases.push(full(i.op0_register()));
+                continue;
+            }
+            return Some(false); // a 32-bit or smaller copy: a value
+        }
+        // stores of it: 8 bytes could be either (a spill), smaller is a value
+        if i.mnemonic() == Mnemonic::Mov && i.op0_kind() == OpKind::Memory && i.op1_kind() == OpKind::Register && is_alias(i.op1_register()) {
+            if i.op1_register().size() < 8 {
+                return Some(false);
+            }
+            continue;
+        }
+        let info = fac.info(&i);
+        let mut read = false;
+        let mut written = Vec::new();
+        for u in info.used_registers() {
+            if !is_alias(u.register()) {
+                continue;
+            }
+            match u.access() {
+                OpAccess::Read | OpAccess::CondRead | OpAccess::ReadWrite | OpAccess::ReadCondWrite => read = true,
+                OpAccess::Write | OpAccess::CondWrite => written.push(full(u.register())),
+                _ => {}
+            }
+        }
+        if read {
+            // a null test says nothing; anything else that reads it uses the value
+            if matches!(i.mnemonic(), Mnemonic::Test | Mnemonic::Cmp) && i.op0_register().size() == 8 {
+                continue;
+            }
+            return Some(false);
+        }
+        aliases.retain(|r| !written.contains(r));
+        if aliases.is_empty() {
+            return None;
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct MethodRec {
     pub attr: FieldAttr,
@@ -81,7 +181,10 @@ pub struct Funcs<'a, 'b> {
     pub methods: HashMap<(u32, String), Vec<MethodRec>>,
     /// destructors declared in each class
     dtors: HashMap<u32, Vec<MethodRec>>,
-    triv_copy: std::cell::RefCell<HashMap<u32, bool>>,
+    triv_copy: std::cell::RefCell<HashMap<u32, Passing>>,
+    /// classes whose passing the PDB cannot tell (a move constructor, no copy constructor listed):
+    /// (by-address votes, in-register votes) from the code of the functions that take them by value
+    pub evidence: HashMap<u32, (usize, usize)>,
     pod: std::cell::RefCell<HashMap<u32, bool>>,
 }
 
@@ -133,7 +236,7 @@ impl<'a, 'b> Funcs<'a, 'b> {
                 dtors.entry(*c).or_default().extend(v.iter().copied());
             }
         }
-        Funcs { db, methods, dtors, triv_copy: Default::default(), pod: Default::default() }
+        Funcs { db, methods, dtors, triv_copy: Default::default(), evidence: HashMap::new(), pod: Default::default() }
     }
 
     fn class_fields(&self, d: u32) -> Vec<&'a Field> {
@@ -167,13 +270,11 @@ impl<'a, 'b> Funcs<'a, 'b> {
             })
     }
 
-    /// Copy constructors (`C(C&)`, `C(const C&)`) the class declares. Move constructors do not
-    /// count: the GOG 4.5.2 call sites pass small classes that only declare one (`TPdxRef<T>`,
-    /// `CSimpleBitMask<E>`) in a register, and those with a copy constructor (`CPdxPtr<T>`,
-    /// `fpml::fixed_point`) by address (docs/ffi.md). Compiler-generated ones are judged through
-    /// the members and bases.
-    fn copy_ctors(&self, d: u32) -> usize {
-        let mut n = 0;
+    /// Copy and move constructors the class declares (`C(C&)`, `C(const C&)`; `C(C&&)`).
+    /// Compiler-generated ones are judged through the members and bases. A defaulted copy
+    /// constructor is not listed at all, a defaulted move constructor is (docs/ffi.md).
+    fn copy_move_ctors(&self, d: u32) -> (usize, usize) {
+        let (mut copy, mut moves) = (0, 0);
         for f in self.class_fields(d) {
             let tys: Vec<(FieldAttr, u32)> = match f {
                 Field::OneMethod { attr, ty, .. } => vec![(*attr, *ty)],
@@ -189,38 +290,118 @@ impl<'a, 'b> Funcs<'a, 'b> {
                 }
                 if let Some(Rec::MFunction { fattr, args, .. }) = self.db.t.get(ty) {
                     let a = self.db.t.args(*args);
-                    if fattr.ctor() && a.len() == 1 && self.is_lref_to(a[0], d) {
-                        n += 1;
+                    if fattr.ctor() && a.len() == 1 && self.is_ref_to(a[0], d) {
+                        if self.is_lref_to(a[0], d) {
+                            copy += 1;
+                        } else {
+                            moves += 1;
+                        }
                     }
                 }
             }
         }
-        n
+        (copy, moves)
     }
 
-    /// Trivially copyable for the purposes of a call (MSVC x64 passes such a class of 1, 2, 4 or 8
-    /// bytes in a register): no virtual functions or bases, no declared copy/move constructor,
-    /// bases and members alike.
-    pub fn trivially_copyable(&self, d: u32) -> bool {
+    /// How MSVC x64 passes a class of 1, 2, 4 or 8 bytes by value, by the PDB: in a register when
+    /// it has a trivial copy constructor (no virtual functions or bases, no declared copy
+    /// constructor, members and bases alike; a destructor does not matter), by address otherwise.
+    /// A declared move constructor without a listed copy constructor is `Unknown`: the copy
+    /// constructor is either deleted (by address) or defaulted (in a register), which the PDB does
+    /// not tell apart; the code of the functions that take the class decides (`learn`).
+    pub fn passing(&self, d: u32) -> Passing {
         if let Some(&v) = self.triv_copy.borrow().get(&d) {
             return v;
         }
-        self.triv_copy.borrow_mut().insert(d, true); // cycles: assume yes
+        self.triv_copy.borrow_mut().insert(d, Passing::Register); // cycles
         let v = match self.db.kind_of(d) {
-            Some(Kind::Enum) => true,
+            Some(Kind::Enum) | None => Passing::Register,
             Some(_) => {
-                !self.has_vfptr_or_vbase(d)
-                    && self.copy_ctors(d) == 0
-                    && self.class_fields(d).iter().all(|f| match f {
-                        Field::Base { ty, .. } => self.db.def_of(*ty).map_or(true, |b| self.trivially_copyable(b)),
-                        Field::Member { ty, .. } => self.member_trivial(*ty, true),
-                        _ => true,
-                    })
+                let (copy, moves) = self.copy_move_ctors(d);
+                let mut v = if self.has_vfptr_or_vbase(d) || copy > 0 {
+                    Passing::Address
+                } else if moves > 0 {
+                    Passing::Unknown
+                } else {
+                    Passing::Register
+                };
+                for f in self.class_fields(d) {
+                    let w = match f {
+                        Field::Base { ty, .. } => self.db.def_of(*ty).map_or(Passing::Register, |b| self.passing(b)),
+                        Field::Member { ty, .. } => self.member_passing(*ty),
+                        _ => Passing::Register,
+                    };
+                    v = v.max(w);
+                }
+                v
             }
-            None => true,
         };
         self.triv_copy.borrow_mut().insert(d, v);
         v
+    }
+
+    fn member_passing(&self, ti: u32) -> Passing {
+        let (t, _) = self.db.strip(ti);
+        match self.db.t.get(t) {
+            Some(Rec::Array { elem, .. }) => self.member_passing(*elem),
+            Some(Rec::Class { .. }) | Some(Rec::Union { .. }) => self.db.def_of(t).map_or(Passing::Register, |d| self.passing(d)),
+            _ => Passing::Register,
+        }
+    }
+
+    /// In a register? `Unknown` classes go by the code's evidence, by address without it.
+    pub fn trivially_copyable(&self, d: u32) -> bool {
+        match self.passing(d) {
+            Passing::Register => true,
+            Passing::Address => false,
+            Passing::Unknown => self.evidence.get(&d).map_or(false, |&(addr, reg)| reg > addr),
+        }
+    }
+
+    /// Votes from the code (`exe`: the build's PE image) for the classes whose passing the PDB
+    /// cannot tell: each function that takes one by value in an argument register either
+    /// dereferences that register (by address) or uses its value (in a register).
+    pub fn learn(&mut self, procs: &[Proc], pe: &crate::pe::Pe) {
+        let mut ev: HashMap<u32, (usize, usize)> = HashMap::new();
+        for p in procs {
+            let Some(rec) = self.db.t.get(p.ty) else { continue };
+            let (ret, args, fattr, instance) = match rec {
+                Rec::Procedure { ret, args, fattr, .. } => (*ret, *args, *fattr, false),
+                Rec::MFunction { ret, args, fattr, this_ty, .. } => (*ret, *args, *fattr, *this_ty != 0),
+                _ => continue,
+            };
+            let mut pos = instance as usize;
+            let (rt, _) = self.db.strip(ret);
+            if let Some(Rec::Class { .. } | Rec::Union { .. }) = self.db.t.get(rt) {
+                let size = self.db.size_of(rt).unwrap_or(0);
+                if instance || fattr.cxx_return_udt() || !matches!(size, 1 | 2 | 4 | 8) {
+                    pos += 1;
+                }
+            }
+            for &a in self.db.t.args(args) {
+                if pos >= 4 {
+                    break;
+                }
+                let (t, _) = self.db.strip(a);
+                if let Some(Rec::Class { .. } | Rec::Union { .. }) = self.db.t.get(t) {
+                    if let Some(d) = self.db.def_of(t) {
+                        let size = self.db.size_of(d).unwrap_or(0);
+                        if matches!(size, 1 | 2 | 4 | 8) && self.passing(d) == Passing::Unknown {
+                            if let Some(by_address) = first_use(pe, p.rva, p.len, ARG_REGS[pos]) {
+                                let e = ev.entry(d).or_default();
+                                if by_address {
+                                    e.0 += 1;
+                                } else {
+                                    e.1 += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                pos += 1;
+            }
+        }
+        self.evidence = ev;
     }
 
     fn member_trivial(&self, ti: u32, copy: bool) -> bool {
@@ -595,12 +776,26 @@ impl<'a, 'b> Funcs<'a, 'b> {
                     c = CT::ptr(c);
                     pass = "copy";
                 }
+                if small && self.passing(def) == Passing::Unknown {
+                    let (a, r) = self.evidence.get(&def).copied().unwrap_or((0, 0));
+                    rewrites.push(format!(
+                        "parameter {} {}: a move constructor and no listed copy constructor, so the PDB does not tell how it is passed; {} (the code of the functions taking it: {} by address, {} in a register)",
+                        i + 1,
+                        cpp,
+                        if direct { "in a register" } else { "by address" },
+                        a,
+                        r
+                    ));
+                    if a + r == 0 {
+                        why = "unknown";
+                    }
+                }
             }
             params.push(Param { cpp, c: c.decl(""), pass, cat, why });
             params_c.push(c);
         }
         if va {
-            rewrites.push("variadic: LuaJIT passes Lua numbers as double and mirrors the vararg registers in both register sets, as MSVC expects".into());
+            rewrites.push("variadic: pass integers as cdata (ffi.new('int32_t', v)): a Lua number goes as a double; LuaJIT mirrors vararg registers in both register sets, as MSVC expects".into());
         }
 
         let virt = match (class, &mname, mrec) {
@@ -648,5 +843,20 @@ impl<'a, 'b> Funcs<'a, 'b> {
             virt,
             rewrites,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_scope;
+
+    #[test]
+    fn scopes() {
+        assert_eq!(split_scope("CShip::CalcRegenAmount"), Some(("CShip", "CalcRegenAmount")));
+        assert_eq!(split_scope("A<B::C>::f"), Some(("A<B::C>", "f")));
+        assert_eq!(split_scope("CFixedPoint::operator<"), Some(("CFixedPoint", "operator<")));
+        assert_eq!(split_scope("CFoo::operator()"), Some(("CFoo", "operator()")));
+        assert_eq!(split_scope("Cooperator::Run"), Some(("Cooperator", "Run")));
+        assert_eq!(split_scope("free_function"), None);
     }
 }

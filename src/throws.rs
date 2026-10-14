@@ -87,7 +87,13 @@ pub fn site_kind(name: &str) -> u8 {
 pub fn analyse(b: &Build) -> Vec<Throws> {
     let n = b.funcs.len();
     let name_of = |i: usize| b.funcs[i].names.first().map(|&k| b.names[k as usize].as_str()).unwrap_or("");
-    let thrower: Vec<bool> = (0..n).map(|i| name_of(i) == "_CxxThrowException").collect();
+    // `_CxxThrowException` itself (static CRT), or the thunk that jumps to its import (DLL CRT)
+    let thrower: Vec<bool> = (0..n)
+        .map(|i| {
+            name_of(i) == "_CxxThrowException"
+                || matches!(b.funcs[i].refs.as_slice(), [Ref::JumpImport(k)] if b.imports[*k as usize].name == "_CxxThrowException")
+        })
+        .collect();
     let rethrow: Vec<bool> = (0..n).map(|i| matches!(name_of(i), "__ExceptionPtrRethrow" | "std::rethrow_exception")).collect();
     let mut t = vec![Throws::default(); n];
     // reverse edges: callee -> callers (direct calls, tail jumps, funclet -> owner)

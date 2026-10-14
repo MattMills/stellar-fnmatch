@@ -183,6 +183,13 @@ enum Cmd {
         /// the build's extract (.fnx): build identity and which functions may throw
         #[arg(long)]
         fnx: Option<PathBuf>,
+        /// the build's executable: the code decides how the classes the PDB is ambiguous about are
+        /// passed by value (a move constructor, no copy constructor listed)
+        #[arg(long)]
+        exe: Option<PathBuf>,
+        /// prefix of every C name
+        #[arg(long)]
+        prefix: Option<String>,
         /// output Lua module
         #[arg(long)]
         out: PathBuf,
@@ -630,9 +637,9 @@ fn main() -> Result<()> {
                 "total", tot.files, tot.frames, tot.frames_no_symbol, tot.frames_in_function, tot.frames_labelled, tot.frames_labelled_hi, tot.files_all_labelled, tot.distinct_functions, tot.distinct_labelled
             );
         }
-        Cmd::Cdef { pdb, fnx, out, classes, classes_file, functions, functions_file, all_classes, all_functions, no_fields, report } => {
+        Cmd::Cdef { pdb, fnx, exe, prefix, out, classes, classes_file, functions, functions_file, all_classes, all_functions, no_fields, report } => {
             let split = |s: Option<String>| -> Vec<String> { s.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default() };
-            let mut opts = fnmatch::ffigen::Options { classes: split(classes), functions: split(functions), all_classes, all_functions, no_fields };
+            let mut opts = fnmatch::ffigen::Options { classes: split(classes), functions: split(functions), all_classes, all_functions, no_fields, exe, prefix: prefix.unwrap_or_default() };
             if let Some(f) = classes_file {
                 opts.classes.extend(std::fs::read_to_string(&f)?.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && !l.starts_with('#')));
             }
@@ -657,10 +664,11 @@ fn main() -> Result<()> {
             let t0 = std::time::Instant::now();
             let info = fnmatch::pdbtypes::load(&pdb)?;
             let db = fnmatch::cdef::Db::new(&info.tpi);
-            let funcs = fnmatch::cdecl::Funcs::new(&db);
+            let mut funcs = fnmatch::cdecl::Funcs::new(&db);
+            let pe = fnmatch::pe::Pe::parse(&std::fs::read(&exe)?)?;
+            funcs.learn(&info.procs, &pe);
             let decls: Vec<fnmatch::cdecl::FuncDecl> = info.procs.iter().filter(|p| !fnmatch::ffigen::skip_proc(&p.name)).filter_map(|p| funcs.declare(p)).collect();
             let b = model::Build::load(&fnx)?;
-            let pe = fnmatch::pe::Pe::parse(&std::fs::read(&exe)?)?;
             eprintln!("{} declarations ({:.1}s)", decls.len(), t0.elapsed().as_secs_f64());
             let lin = match &linux_nm {
                 Some(p) => Some(fficheck::check_linux(&decls, &std::fs::read_to_string(p)?)),

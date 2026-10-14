@@ -278,6 +278,11 @@ fn family(r: &Rec) -> Option<(char, &str, Option<&str>, bool)> {
 
 impl<'a> Db<'a> {
     pub fn new(t: &'a Tpi) -> Db<'a> {
+        Self::with_prefix(t, "")
+    }
+
+    /// With `prefix` before every C name.
+    pub fn with_prefix(t: &'a Tpi, prefix: &str) -> Db<'a> {
         let mut by_unique: HashMap<(char, String), u32> = HashMap::new();
         let mut by_name: HashMap<(char, String), u32> = HashMap::new();
         let mut udts = Vec::new();
@@ -314,7 +319,7 @@ impl<'a> Db<'a> {
         let mut by_cpp: HashMap<String, Vec<u32>> = HashMap::new();
         for &ti in &udts {
             let (_, name, unique, _) = family(t.get(ti).unwrap()).unwrap();
-            let mut c = sanitize(name);
+            let mut c = format!("{}{}", prefix, sanitize(name));
             if c.len() > 100 {
                 c = format!("{}_{}", &c[..80], hash_hex(name, 12));
             }
@@ -1115,4 +1120,40 @@ fn lanes(g: Vec<Item>) -> Vec<Vec<Item>> {
 /// Classes that are interfaces get `struct` too.
 pub fn is_class_kind(k: ClassKind) -> bool {
     matches!(k, ClassKind::Class | ClassKind::Struct | ClassKind::Interface)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names() {
+        assert_eq!(sanitize("CPdxArray<CShip *,int>"), "CPdxArray_CShipP_int_");
+        assert_eq!(sanitize("NModifierNode::CModifierNodeBase<CModifier,enum EModifierNodeCategory>"), "NModifierNode__CModifierNodeBase_CModifier_enumEModifierNodeCategory_");
+        assert_eq!(sanitize("int"), "int_");
+        assert_eq!(sanitize("`anonymous namespace'::X"), "anonymousnamespace__X");
+        assert_eq!(sanitize("3d"), "_3d");
+    }
+
+    #[test]
+    fn declarators() {
+        let i = CT::base("int32_t");
+        assert_eq!(CT::ptr(i.clone()).decl("p"), "int32_t *p");
+        assert_eq!(CT::Arr { of: Box::new(i.clone()), n: 4 }.decl("a"), "int32_t a[4]");
+        assert_eq!(CT::ptr(CT::Arr { of: Box::new(i.clone()), n: 4 }).decl(""), "int32_t (*)[4]");
+        let f = CT::Func { ret: Box::new(CT::ptr(CT::base("Vec2"))), params: vec![CT::ptr(CT::base("Derived").with_const(true)), CT::ptr(CT::base("Vec2"))], va: false };
+        assert_eq!(CT::ptr(f).decl(""), "Vec2 *(*)(const Derived *, Vec2 *)");
+        let v = CT::Func { ret: Box::new(i.clone()), params: vec![i.clone()], va: true };
+        assert_eq!(CT::ptr(v).decl(""), "int32_t (*)(int32_t, ...)");
+        assert_eq!(CT::Ptr { to: Box::new(CT::base("char")), konst: true }.decl("s"), "char *const s");
+    }
+
+    #[test]
+    fn primitives() {
+        assert_eq!(prim(0x74).0, CT::base("int32_t")); // int
+        assert_eq!(prim(0x12).0, CT::base("int32_t")); // long is 32-bit on MSVC
+        assert_eq!(prim(0x71).0, CT::base("uint16_t")); // wchar_t
+        assert_eq!(prim(0x42).0, CT::base("double")); // long double
+        assert_eq!(prim(0x603).0, CT::void_ptr()); // void* (64-bit pointer mode)
+    }
 }

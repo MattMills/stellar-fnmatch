@@ -25,6 +25,10 @@ pub struct Options {
     pub all_functions: bool,
     /// leave the member lists out of the module (they are for validation and introspection)
     pub no_fields: bool,
+    /// the build's executable: the code tells how classes the PDB is ambiguous about are passed
+    pub exe: Option<std::path::PathBuf>,
+    /// prefix of every C name (when the Lua state has declarations of its own)
+    pub prefix: String,
 }
 
 #[derive(Default, Debug, serde::Serialize)]
@@ -59,6 +63,11 @@ pub struct Report {
     pub missing_classes: Vec<String>,
     pub missing_functions: Vec<String>,
     pub odr_conflicts: usize,
+    /// classes passed by value whose passing the PDB cannot tell: decided by the code (by address,
+    /// in a register), and left by address without evidence
+    pub passing_by_code_address: usize,
+    pub passing_by_code_register: usize,
+    pub passing_no_evidence: usize,
 }
 
 pub fn lua_str(s: &str) -> String {
@@ -101,9 +110,21 @@ pub fn generate(pdb_path: &Path, fnx: Option<&Build>, opts: &Options) -> Result<
 }
 
 pub fn generate_from(info: &PdbInfo, pdb_path: &Path, fnx: Option<&Build>, opts: &Options) -> Result<Generated> {
-    let db = Db::new(&info.tpi);
-    let funcs = Funcs::new(&db);
+    let db = Db::with_prefix(&info.tpi, &opts.prefix);
+    let mut funcs = Funcs::new(&db);
+    if let Some(exe) = &opts.exe {
+        let pe = crate::pe::Pe::parse(&std::fs::read(exe)?)?;
+        funcs.learn(&info.procs, &pe);
+    }
     let mut rep = Report { odr_conflicts: db.conflicts, ..Default::default() };
+    for (&d, &(a, r)) in &funcs.evidence {
+        let _ = d;
+        if r > a {
+            rep.passing_by_code_register += 1;
+        } else {
+            rep.passing_by_code_address += 1;
+        }
+    }
 
     // throws, by rva
     let throws_by_rva: HashMap<u32, throws::Throws> = match fnx {
@@ -264,6 +285,7 @@ pub fn generate_from(info: &PdbInfo, pdb_path: &Path, fnx: Option<&Build>, opts:
                 }
             }
             for p in &f.params {
+                rep.passing_no_evidence += (p.why == "unknown") as usize;
                 if p.pass == "copy" {
                     rep.by_value_copies += 1;
                 } else if p.cat == "v" {

@@ -900,3 +900,28 @@ pub fn summary_text(lin: Option<&LinuxReport>, vt: &VtableReport, code: &CodeRep
     let _ = writeln!(s, "RaiseException callers: {}", thr.seh_sites.join("; "));
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_names() {
+        let (n, p, k) = parse_linux("CShip::CalcRegenAmount(CFixedPoint, CFixedPoint, CFixedPoint) const").unwrap();
+        assert_eq!((n.as_str(), p.len(), k), ("CShip::CalcRegenAmount", 3, true));
+        let (n, p, _) = parse_linux("bool CFoo::operator<<CBar>(CBar const&) [clone .cold]").unwrap();
+        assert_eq!((n.as_str(), p[0].as_str()), ("CFoo::operator<<CBar>", "CBar const&"));
+        let (n, p, _) = parse_linux("void (anonymous namespace)::Helper(int (*)(void*), std::map<int, int>&)").unwrap();
+        assert_eq!((n.as_str(), p.len()), ("(anonymous namespace)::Helper", 2));
+        assert_eq!(linux_cat("CString const&"), "rc");
+        assert_eq!(linux_cat("CCountry const* const&"), "rc");
+        assert_eq!(linux_cat("char const*"), "pc");
+        assert_eq!(linux_cat("SForceData const* const*"), "pc");
+        assert_eq!(linux_cat("char const**"), "p");
+        assert_eq!(linux_cat("unsigned long"), "f:u64");
+        assert_eq!(linux_cat("void (*)(int)"), "p");
+        assert_eq!(linux_cat("CFixedPoint"), "v");
+        assert_eq!(norm_name("CPdxArray<unsigned __int64,int>::Reserve"), "CPdxArray<unsigned long,int>::Reserve");
+        assert_eq!(norm_name("CPdxModifier<enum ModifierType,class CModifier>"), "CPdxModifier<ModifierType,CModifier>");
+    }
+}
